@@ -7,10 +7,17 @@ LABEL org.opencontainers.image.licenses="MIT"
 
 # --------------------------------------------------------------------------
 # System dependencies
-# alpine uses apk instead of apt-get
-# docker-cli-compose is needed for the compose-file update strategy (Mode 2)
+#
+# apk upgrade first — ensures all bundled packages (including the Go binaries
+# inside docker-cli-compose such as containerd, golang.org/x/crypto, and
+# golang.org/x/net) are at their latest patched versions rather than whatever
+# was cached in the base image layer at the time python:alpine was built.
+#
+# docker-cli-compose is needed for the compose-file update strategy (Mode 2).
+# curl is used by the HEALTHCHECK.
 # --------------------------------------------------------------------------
-RUN apk add --no-cache curl docker-cli-compose
+RUN apk upgrade --no-cache \
+ && apk add --no-cache curl docker-cli-compose
 
 # --------------------------------------------------------------------------
 # Python dependencies
