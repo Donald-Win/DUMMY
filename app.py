@@ -3,24 +3,18 @@ DUMMY - Docker Update Made Manageable, Yay!
 
 Three update strategies, auto-detected from Docker labels:
 
-  1. docker_api  (simplest) - pull new image, recreate container via Docker SDK.
-                              No files needed. Just add dummy.enable=true to a service.
-
-  2. compose     - edit the image tag in-place in the compose YAML file, then
-                   run docker compose up -d <service> to apply.
+  1. docker_api  - pull + recreate via Docker SDK. Just add dummy.enable=true.
+  2. compose     - edit the compose YAML + docker compose up -d.
                    Add dummy.enable=true + dummy.compose_file=/path/to/compose.yaml
-
-  3. env_file    - update a version variable in a .env file, then restart the
-                   container. The original DUMMY behaviour.
+  3. env_file    - update a .env variable + restart.
                    Add dummy.enable=true + dummy.env_var=MY_VAR_NAME
-
-All three are discovered from Docker labels. VERSION_VARS env var still works
-for backward compatibility (it maps to the env_file strategy).
 """
 
 import os
 import re
 import time
+import uuid
+import json
 import logging
 import sqlite3
 import subprocess
@@ -28,7 +22,7 @@ import threading
 from datetime import datetime
 
 import yaml
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template_string, request, jsonify, Response
 import docker as dockerlib
 import requests as req
 
@@ -91,6 +85,58 @@ STRATEGY_LABELS = {
     STRATEGY_COMPOSE:    "Compose file",
     STRATEGY_ENV_FILE:   "Env file",
 }
+
+# ---------------------------------------------------------------------------
+# Job tracking (in-memory, for live progress reporting)
+# ---------------------------------------------------------------------------
+_jobs: dict = {}         # {job_id: {log, done, success, error, message, started}}
+_jobs_lock = threading.Lock()
+
+# Check timing
+_last_check_time: float = 0.0
+_next_check_time: float = 0.0
+
+
+def _new_job() -> str:
+    job_id = str(uuid.uuid4())[:8]
+    with _jobs_lock:
+        _jobs[job_id] = {
+            "log":     [],
+            "done":    False,
+            "success": False,
+            "error":   "",
+            "message": "",
+            "started": time.time(),
+        }
+    # Prune jobs older than 10 minutes
+    cutoff = time.time() - 600
+    with _jobs_lock:
+        stale = [k for k, v in _jobs.items() if v["started"] < cutoff and v["done"]]
+        for k in stale:
+            del _jobs[k]
+    return job_id
+
+
+def _jlog(job_id: str, msg: str, level: str = "info"):
+    log.info("[job:%s] %s", job_id, msg)
+    if job_id:
+        with _jobs_lock:
+            if job_id in _jobs:
+                _jobs[job_id]["log"].append({
+                    "t":   datetime.now().strftime("%H:%M:%S"),
+                    "msg": msg,
+                    "lvl": level,
+                })
+
+
+def _job_done(job_id: str, success: bool, message: str = "", error: str = ""):
+    with _jobs_lock:
+        if job_id in _jobs:
+            _jobs[job_id]["done"]    = True
+            _jobs[job_id]["success"] = success
+            _jobs[job_id]["message"] = message
+            _jobs[job_id]["error"]   = error
+
 
 # ---------------------------------------------------------------------------
 # Tag filtering
@@ -251,22 +297,14 @@ def get_changelog(image: str, label_override: str = None):
 def init_db():
     db_dir = os.path.dirname(DB_PATH)
     os.makedirs(db_dir, exist_ok=True)
-
-    # Persistence check — warn loudly if /data looks like it is NOT a bind mount.
-    # A bind mount will have a different device ID than its parent directory.
-    # If they match, the directory is on the container overlay filesystem and
-    # data will be lost on every container recreate.
     try:
-        import stat
-        data_dev  = os.stat(db_dir).st_dev
+        data_dev   = os.stat(db_dir).st_dev
         parent_dev = os.stat(os.path.dirname(db_dir.rstrip("/"))).st_dev
         if data_dev == parent_dev:
             log.warning("=" * 60)
-            log.warning("PERSISTENCE WARNING: %s does not appear to be a", db_dir)
-            log.warning("bind-mounted host directory. Version history and")
-            log.warning("rollback data will be LOST when the container restarts.")
-            log.warning("Add this to your compose.yaml under dummy volumes:")
-            log.warning("  - /stacks/data/dummy:/data")
+            log.warning("PERSISTENCE WARNING: %s is not a bind-mounted host", db_dir)
+            log.warning("directory. History and rollback data will be LOST on restart.")
+            log.warning("Add to compose.yaml:  - /stacks/data/dummy:/data")
             log.warning("=" * 60)
         else:
             log.info("Persistence OK — %s is a bind-mounted volume.", db_dir)
@@ -413,7 +451,6 @@ def get_compose_image_tag(compose_path: str, service_name: str):
 
 
 def set_compose_image_tag(compose_path: str, service_name: str, new_tag: str):
-    """Returns (success, old_tag)."""
     data = read_compose(compose_path)
     if not data:
         return False, ""
@@ -427,7 +464,6 @@ def set_compose_image_tag(compose_path: str, service_name: str, new_tag: str):
 
 
 def run_compose_up(compose_path: str, service_name: str):
-    """Returns (success, error_string)."""
     try:
         result = subprocess.run(
             ["docker", "compose", "-f", compose_path, "up", "-d", "--no-deps", service_name],
@@ -441,7 +477,7 @@ def run_compose_up(compose_path: str, service_name: str):
 
 
 # ---------------------------------------------------------------------------
-# Docker API recreate helpers
+# Docker API recreate
 # ---------------------------------------------------------------------------
 
 def get_image_parts(container_obj):
@@ -461,8 +497,13 @@ def get_image_parts(container_obj):
     return "unknown", "unknown"
 
 
-def recreate_container(client, container_obj, new_image: str):
-    """Pull new_image, stop+remove old container, recreate with same config. Returns (success, error)."""
+def recreate_container(client, container_obj, new_image: str, jlog=None):
+    """Pull new_image, stop+remove old container, recreate with same config."""
+    def _log(msg):
+        log.info(msg)
+        if jlog:
+            jlog(msg)
+
     name     = container_obj.name
     attrs    = container_obj.attrs
     host_cfg = attrs.get("HostConfig", {})
@@ -494,23 +535,23 @@ def recreate_container(client, container_obj, new_image: str):
     }
     create_kwargs = {k: v for k, v in create_kwargs.items() if v is not None and v != {} and v != []}
 
+    _log(f"Pulling {new_image}...")
     try:
-        log.info("Pulling %s ...", new_image)
         client.images.pull(new_image)
     except Exception as exc:
         return False, f"Pull failed: {exc}"
 
+    _log(f"Stopping {name}...")
     try:
-        log.info("Stopping and removing %s ...", name)
         container_obj.stop(timeout=30)
+        _log(f"Removing {name}...")
         container_obj.remove()
     except Exception as exc:
         return False, f"Stop/remove failed: {exc}"
 
+    _log(f"Recreating {name}...")
     try:
-        log.info("Recreating %s ...", name)
         new_container = client.containers.create(**create_kwargs)
-
         default_net = create_kwargs.get("network_mode", "bridge")
         for net_name, net_data in net_cfg.items():
             if net_name == default_net:
@@ -519,9 +560,10 @@ def recreate_container(client, container_obj, new_image: str):
                 network = client.networks.get(net_name)
                 aliases = [a for a in (net_data.get("Aliases") or []) if not re.match(r"^[0-9a-f]{12}$", a)]
                 network.connect(new_container, aliases=aliases or None)
+                _log(f"Attached to network: {net_name}")
             except Exception as exc:
                 log.warning("Could not attach %s to %s: %s", name, net_name, exc)
-
+        _log(f"Starting {name}...")
         new_container.start()
         return True, ""
     except Exception as exc:
@@ -532,8 +574,10 @@ def recreate_container(client, container_obj, new_image: str):
 # Health check
 # ---------------------------------------------------------------------------
 
-def check_container_health(container_name: str, timeout: int = None) -> bool:
+def check_container_health(container_name: str, timeout: int = None, jlog=None) -> bool:
     timeout = timeout or HEALTH_TIMEOUT
+    if jlog:
+        jlog(f"Health check — waiting up to {timeout}s...")
     try:
         client    = dockerlib.from_env()
         container = client.containers.get(container_name)
@@ -543,11 +587,17 @@ def check_container_health(container_name: str, timeout: int = None) -> bool:
             if container.status == "running":
                 health = container.attrs.get("State", {}).get("Health", {})
                 if not health or health.get("Status") == "healthy":
+                    if jlog:
+                        jlog("Health check passed ✓")
                     return True
             time.sleep(2)
+        if jlog:
+            jlog("Health check timed out ✗", "error")
         return False
     except Exception as exc:
         log.error("check_container_health %s: %s", container_name, exc)
+        if jlog:
+            jlog(f"Health check error: {exc}", "error")
         return False
 
 
@@ -641,7 +691,10 @@ def get_monitored_containers() -> list:
 # Update / rollback
 # ---------------------------------------------------------------------------
 
-def update_service(container: str, new_tag: str) -> dict:
+def update_service(container: str, new_tag: str, job_id: str = None) -> dict:
+    def jl(msg, level="info"):
+        _jlog(job_id, msg, level)
+
     try:
         client        = dockerlib.from_env()
         container_obj = client.containers.get(container)
@@ -653,31 +706,43 @@ def update_service(container: str, new_tag: str) -> dict:
         if image == "unknown":
             return {"success": False, "error": "Cannot determine image name"}
 
+        jl(f"Container:  {container}")
+        jl(f"Strategy:   {STRATEGY_LABELS[strategy]}")
+        jl(f"Target tag: {new_tag}")
+
         # ── ENV FILE ──────────────────────────────────────────────────────
         if strategy == STRATEGY_ENV_FILE:
             var         = strategy_cfg["env_var"]
             current_tag = read_env().get(var, "unknown")
+            jl(f"Current:    {current_tag}  ({var})")
             add_to_history(container, current_tag, status="previous")
 
+            jl(f"Writing {var}={new_tag} to .env...")
             if not write_env_var(var, new_tag):
                 return {"success": False, "error": f"Failed to write {var} to {ENV_FILE}"}
+
+            jl(f"Pulling {image}:{new_tag}...")
             try:
                 client.images.pull(image, tag=new_tag)
             except Exception as exc:
                 write_env_var(var, current_tag)
                 return {"success": False, "error": f"Pull failed: {exc}"}
 
+            jl("Restarting container...")
             container_obj.restart()
-            if not check_container_health(container):
+
+            if not check_container_health(container, jlog=jl):
+                jl(f"Rolling back — restoring {var}={current_tag}", "warn")
                 write_env_var(var, current_tag)
                 container_obj.restart()
                 check_container_health(container, timeout=30)
                 notify(f"Update Failed: {container}", f"Rolled back to {current_tag}", priority="4", tags="warning")
-                return {"success": False, "error": "Health check failed - auto-rolled back"}
+                return {"success": False, "error": "Health check failed — auto-rolled back"}
 
             add_to_history(container, new_tag)
             clear_available_update(container)
-            notify(f"Updated: {container}", f"checkmark {container}: {current_tag} to {new_tag}", tags="white_check_mark")
+            jl(f"Done! {current_tag} → {new_tag}")
+            notify(f"Updated: {container}", f"{container}: {current_tag} → {new_tag}", tags="white_check_mark")
             return {"success": True, "message": f"Updated to {new_tag}"}
 
         # ── COMPOSE FILE ──────────────────────────────────────────────────
@@ -685,49 +750,59 @@ def update_service(container: str, new_tag: str) -> dict:
             compose_file = strategy_cfg["compose_file"]
             compose_svc  = strategy_cfg["compose_svc"]
             current_tag  = get_compose_image_tag(compose_file, compose_svc) or "unknown"
+            jl(f"Current:    {current_tag}")
             add_to_history(container, current_tag, status="previous")
 
+            jl(f"Editing image tag in {compose_file}...")
             ok, old_tag = set_compose_image_tag(compose_file, compose_svc, new_tag)
             if not ok:
                 return {"success": False, "error": f"Failed to edit {compose_file}"}
 
+            jl(f"Running: docker compose up -d {compose_svc}")
             ok, err = run_compose_up(compose_file, compose_svc)
             if not ok:
                 set_compose_image_tag(compose_file, compose_svc, old_tag)
                 return {"success": False, "error": f"docker compose up failed: {err}"}
 
-            if not check_container_health(container):
+            if not check_container_health(container, jlog=jl):
+                jl("Rolling back compose file...", "warn")
                 set_compose_image_tag(compose_file, compose_svc, old_tag)
                 run_compose_up(compose_file, compose_svc)
                 notify(f"Update Failed: {container}", f"Rolled back to {old_tag}", priority="4", tags="warning")
-                return {"success": False, "error": "Health check failed - auto-rolled back"}
+                return {"success": False, "error": "Health check failed — auto-rolled back"}
 
             add_to_history(container, new_tag)
             clear_available_update(container)
-            notify(f"Updated: {container}", f"{container}: {current_tag} to {new_tag}", tags="white_check_mark")
+            jl(f"Done! {current_tag} → {new_tag}")
+            notify(f"Updated: {container}", f"{container}: {current_tag} → {new_tag}", tags="white_check_mark")
             return {"success": True, "message": f"Updated to {new_tag}"}
 
         # ── DOCKER API ────────────────────────────────────────────────────
         else:
             _, current_tag = get_image_parts(container_obj)
+            jl(f"Current:    {current_tag}")
             add_to_history(container, current_tag, status="previous")
 
-            ok, err = recreate_container(client, container_obj, f"{image}:{new_tag}")
+            ok, err = recreate_container(client, container_obj, f"{image}:{new_tag}",
+                                         jlog=lambda m: jl(m))
             if not ok:
                 return {"success": False, "error": err}
 
-            if not check_container_health(container):
+            if not check_container_health(container, jlog=jl):
+                jl("Rolling back to previous image...", "warn")
                 try:
                     failed_obj = client.containers.get(container)
-                    recreate_container(client, failed_obj, f"{image}:{current_tag}")
+                    recreate_container(client, failed_obj, f"{image}:{current_tag}",
+                                       jlog=lambda m: jl(m))
                 except Exception:
                     pass
                 notify(f"Update Failed: {container}", f"Rolled back to {current_tag}", priority="4", tags="warning")
-                return {"success": False, "error": "Health check failed - auto-rolled back"}
+                return {"success": False, "error": "Health check failed — auto-rolled back"}
 
             add_to_history(container, new_tag)
             clear_available_update(container)
-            notify(f"Updated: {container}", f"{container}: {current_tag} to {new_tag}", tags="white_check_mark")
+            jl(f"Done! {current_tag} → {new_tag}")
+            notify(f"Updated: {container}", f"{container}: {current_tag} → {new_tag}", tags="white_check_mark")
             return {"success": True, "message": f"Updated to {new_tag}"}
 
     except Exception as exc:
@@ -735,20 +810,27 @@ def update_service(container: str, new_tag: str) -> dict:
         return {"success": False, "error": str(exc)}
 
 
-def rollback_service(container: str, target_tag: str = None) -> dict:
+def rollback_service(container: str, target_tag: str = None, job_id: str = None) -> dict:
+    def jl(msg, level="info"):
+        _jlog(job_id, msg, level)
+
     try:
         history = get_history(container)
         if not history:
             return {"success": False, "error": "No version history available"}
+
         if not target_tag:
             candidates = [h for h in history if h["status"] in ("previous", "deployed", "rolled_back")]
             if len(candidates) < 2:
                 return {"success": False, "error": "No previous version to roll back to"}
             target_tag = candidates[1]["tag"]
-        result = update_service(container, target_tag)
+
+        jl(f"Rolling back {container} to {target_tag}")
+        result = update_service(container, target_tag, job_id=job_id)
         if result.get("success"):
             add_to_history(container, target_tag, status="rolled_back")
         return result
+
     except Exception as exc:
         log.error("rollback_service %s: %s", container, exc)
         return {"success": False, "error": str(exc)}
@@ -758,252 +840,753 @@ def rollback_service(container: str, target_tag: str = None) -> dict:
 # Background checker
 # ---------------------------------------------------------------------------
 
-def _check_once():
+def _check_once(job_id: str = None):
+    global _last_check_time
+    def jl(msg, level="info"):
+        _jlog(job_id, msg, level)
+
     try:
+        containers  = get_monitored_containers()
         updates_found = []
-        for item in get_monitored_containers():
+        jl(f"Checking {len(containers)} container(s)...")
+
+        for item in containers:
             container   = item["container"]
             image       = item["image"]
             current_tag = item["current_tag"]
             if image == "unknown":
                 continue
+            jl(f"Checking {container} ({current_tag})...")
             latest = get_latest_tag(image, current_tag)
             if latest and latest != current_tag:
-                log.info("Update available: %s  %s -> %s", container, current_tag, latest)
+                jl(f"  → Update available: {latest}")
                 save_available_update(container, latest)
                 updates_found.append((container, current_tag, latest))
                 if AUTO_UPDATE:
-                    log.info("AUTO_UPDATE: %s -> %s for %s", current_tag, latest, container)
-                    result = update_service(container, latest)
+                    jl(f"  → AUTO_UPDATE: applying {latest}...")
+                    result = update_service(container, latest, job_id=job_id)
                     if not result["success"]:
-                        log.error("Auto-update failed for %s: %s", container, result["error"])
+                        jl(f"  → Auto-update failed: {result['error']}", "error")
+            else:
+                jl(f"  → Up to date")
+
+        _last_check_time = time.time()
+
         if updates_found and not AUTO_UPDATE:
-            lines = "\n".join(f"- {n}: {c} -> {l}" for n, c, l in updates_found)
+            lines = "\n".join(f"- {n}: {c} → {l}" for n, c, l in updates_found)
             notify(f"{len(updates_found)} update(s) available", f"Updates ready:\n{lines}")
+            jl(f"Found {len(updates_found)} update(s). Notifications sent.")
+        elif not updates_found:
+            jl("All containers are up to date.")
+
     except Exception as exc:
         log.error("_check_once: %s", exc)
+        jl(f"Check failed: {exc}", "error")
 
 
 def check_for_updates():
+    global _next_check_time
     while True:
-        log.info("Running update check ...")
+        log.info("Running update check...")
         _check_once()
+        _next_check_time = time.time() + CHECK_INTERVAL
         time.sleep(CHECK_INTERVAL)
 
 
 # ---------------------------------------------------------------------------
-# Flask
+# Persistence check
+# ---------------------------------------------------------------------------
+
+def _check_persistence() -> bool:
+    try:
+        db_dir     = os.path.dirname(DB_PATH)
+        data_dev   = os.stat(db_dir).st_dev
+        parent_dev = os.stat(os.path.dirname(db_dir.rstrip("/"))).st_dev
+        return data_dev != parent_dev
+    except Exception:
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Flask app + HTML template
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
 
 HTML = r"""<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{{ title }}</title>
 <style>
+/* ── Theme variables ─────────────────────────────────────────────────────── */
+:root {
+  --bg:          linear-gradient(135deg,#1a1a2e 0%,#16213e 50%,#0f3460 100%);
+  --surface:     rgba(255,255,255,0.05);
+  --surface-2:   rgba(255,255,255,0.08);
+  --border:      rgba(255,255,255,0.09);
+  --border-2:    rgba(255,255,255,0.15);
+  --text-hi:     #e2e8f0;
+  --text-md:     #94a3b8;
+  --text-lo:     #64748b;
+  --accent:      #818cf8;
+  --accent-2:    #6366f1;
+  --val-bg:      rgba(255,255,255,0.06);
+  --val-border:  rgba(255,255,255,0.08);
+  --val-text:    #cbd5e1;
+  --code-bg:     rgba(0,0,0,0.3);
+  --shadow:      rgba(0,0,0,0.4);
+}
+[data-theme="light"] {
+  --bg:          linear-gradient(135deg,#f0f4ff 0%,#e8f0fe 50%,#eef7ff 100%);
+  --surface:     rgba(255,255,255,0.85);
+  --surface-2:   rgba(255,255,255,0.95);
+  --border:      rgba(0,0,0,0.08);
+  --border-2:    rgba(0,0,0,0.15);
+  --text-hi:     #1e293b;
+  --text-md:     #475569;
+  --text-lo:     #94a3b8;
+  --accent:      #4f46e5;
+  --accent-2:    #4338ca;
+  --val-bg:      rgba(0,0,0,0.04);
+  --val-border:  rgba(0,0,0,0.08);
+  --val-text:    #334155;
+  --code-bg:     rgba(0,0,0,0.06);
+  --shadow:      rgba(0,0,0,0.12);
+}
+
+/* ── Reset + base ────────────────────────────────────────────────────────── */
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:linear-gradient(135deg,#1a1a2e 0%,#16213e 50%,#0f3460 100%);min-height:100vh;padding:24px}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+     background:var(--bg);min-height:100vh;padding:20px;
+     color:var(--text-hi);transition:background .3s,color .3s}
 .wrap{max-width:1100px;margin:0 auto}
-.hdr{background:rgba(255,255,255,0.05);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.1);border-radius:16px;padding:28px;margin-bottom:24px}
-h1{color:#e2e8f0;font-size:1.8em;margin-bottom:4px}
-.tagline{color:#64748b;font-size:.9em;margin-bottom:12px;font-style:italic}
-.sub{color:#94a3b8}.sub span{color:#60a5fa;font-weight:600}
-.stats{display:flex;gap:14px;margin-top:18px;flex-wrap:wrap}
-.stat{background:rgba(255,255,255,0.07);padding:14px 20px;border-radius:10px;min-width:110px}
-.stat-num{font-size:1.7em;font-weight:700;color:#818cf8}
-.stat-lbl{color:#94a3b8;font-size:.85em;margin-top:2px}
-.cfg-bar{background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:10px 18px;margin-bottom:20px;display:flex;gap:18px;flex-wrap:wrap;font-size:.85em;color:#64748b}
-.cfg-on{color:#34d399!important}.cfg-off{color:#f87171!important}
-.refresh-row{display:flex;justify-content:flex-end;margin-bottom:16px}
-.btn-refresh{background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);color:#cbd5e1;padding:8px 18px;border-radius:8px;cursor:pointer;font-size:.9em;transition:all .2s}
-.btn-refresh:hover{background:rgba(255,255,255,0.14)}
-.card{background:rgba(255,255,255,0.05);backdrop-filter:blur(6px);border:1px solid rgba(255,255,255,0.09);border-radius:14px;padding:22px;margin-bottom:16px;transition:transform .2s}
-.card:hover{transform:translateY(-2px)}.card.has-update{border-left:4px solid #f59e0b}
-.card-row{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:16px}
-.cname{font-size:1.25em;font-weight:700;color:#e2e8f0}
-.badges{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-.badge{padding:5px 11px;border-radius:20px;font-size:.75em;font-weight:700;text-transform:uppercase;letter-spacing:.04em}
-.running{background:rgba(52,211,153,.15);color:#34d399;border:1px solid rgba(52,211,153,.3)}
-.stopped{background:rgba(248,113,113,.15);color:#f87171;border:1px solid rgba(248,113,113,.3)}
-.badge-update{background:rgba(245,158,11,.15);color:#f59e0b;border:1px solid rgba(245,158,11,.3)}
-.badge-strategy{background:rgba(99,102,241,.1);color:#a5b4fc;border:1px solid rgba(99,102,241,.2);font-size:.7em}
-.info{background:rgba(0,0,0,.2);padding:14px 16px;border-radius:10px;margin-bottom:14px}
-.info-row{display:flex;margin:7px 0;flex-wrap:wrap;align-items:center;gap:6px}
-.lbl{font-weight:600;color:#64748b;min-width:120px;font-size:.88em}
-.val{font-family:monospace;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.08);padding:3px 10px;border-radius:5px;font-size:.88em;color:#cbd5e1}
-.val.new{background:rgba(245,158,11,.12);border-color:rgba(245,158,11,.3);color:#fbbf24}
-.history{margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,.08)}
-.history-title{font-weight:600;color:#64748b;margin-bottom:8px;font-size:.85em;text-transform:uppercase;letter-spacing:.06em}
-.h-item{font-size:.82em;color:#64748b;margin:4px 0;font-family:monospace;display:flex;gap:10px;flex-wrap:wrap}
-.h-tag{color:#94a3b8}.h-date{color:#475569}
-.h-status{font-size:.78em;padding:1px 7px;border-radius:9px}
-.h-deployed{background:rgba(52,211,153,.1);color:#34d399}
-.h-rolled_back{background:rgba(245,158,11,.1);color:#f59e0b}
-.h-previous{background:rgba(100,116,139,.1);color:#64748b}
-.btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;align-items:center}
-.btn{padding:9px 18px;border:none;border-radius:8px;font-weight:600;cursor:pointer;transition:all .2s;font-size:.9em}
+
+/* ── Dashboard header ────────────────────────────────────────────────────── */
+.dash{background:var(--surface);backdrop-filter:blur(12px);
+      border:1px solid var(--border);border-radius:18px;
+      padding:24px;margin-bottom:20px}
+.dash-title-row{display:flex;justify-content:space-between;align-items:flex-start;
+                margin-bottom:20px;flex-wrap:wrap;gap:10px}
+.dash-title h1{color:var(--text-hi);font-size:1.7em;margin-bottom:2px}
+.dash-title p{color:var(--text-lo);font-size:.88em;font-style:italic}
+.dash-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+
+/* ── Stat grid ───────────────────────────────────────────────────────────── */
+.stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
+.stat-card{background:var(--surface-2);border:1px solid var(--border);
+           border-radius:12px;padding:16px 18px;text-align:center}
+.stat-num{font-size:2em;font-weight:700;color:var(--accent);line-height:1}
+.stat-lbl{color:var(--text-md);font-size:.82em;margin-top:5px}
+.stat-card.has-updates .stat-num{color:#f59e0b}
+.stat-card.all-good .stat-num{color:#34d399}
+
+/* ── Dash info row ───────────────────────────────────────────────────────── */
+.dash-info-row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.dash-panel{background:var(--surface-2);border:1px solid var(--border);
+            border-radius:12px;padding:16px}
+.dash-panel-lbl{font-size:.75em;font-weight:700;text-transform:uppercase;
+                letter-spacing:.07em;color:var(--text-lo);margin-bottom:10px}
+
+/* ── Config flags ────────────────────────────────────────────────────────── */
+.flags{display:flex;flex-wrap:wrap;gap:7px}
+.flag{font-size:.78em;font-weight:600;padding:4px 10px;border-radius:20px}
+.flag-on {background:rgba(52,211,153,.15);color:#34d399;border:1px solid rgba(52,211,153,.3)}
+.flag-off{background:rgba(100,116,139,.1);color:var(--text-md);border:1px solid rgba(100,116,139,.2)}
+.flag-warn{background:rgba(245,158,11,.15);color:#f59e0b;border:1px solid rgba(245,158,11,.3)}
+.flag-ok {background:rgba(52,211,153,.1);color:#34d399;border:1px solid rgba(52,211,153,.2)}
+
+/* ── Timing panel ────────────────────────────────────────────────────────── */
+.timing{display:flex;flex-direction:column;gap:6px;margin-bottom:12px}
+.timing-row{display:flex;gap:6px;align-items:center;font-size:.85em;color:var(--text-md)}
+.timing-row .t-icon{font-size:1em}
+.timing-row .t-val{color:var(--text-hi);font-weight:600}
+.action-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:4px}
+
+/* ── Warn bar ────────────────────────────────────────────────────────────── */
+.warn-bar{background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.3);
+          border-radius:10px;padding:10px 16px;margin-bottom:16px;
+          color:#f59e0b;font-size:.87em}
+.warn-bar code{background:var(--code-bg);padding:1px 6px;border-radius:4px;font-family:monospace}
+
+/* ── Generic buttons ─────────────────────────────────────────────────────── */
+.btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border:none;
+     border-radius:8px;font-weight:600;cursor:pointer;font-size:.87em;
+     transition:all .18s;text-decoration:none;white-space:nowrap}
+.btn:disabled{opacity:.4;cursor:not-allowed;pointer-events:none}
+.btn-ghost{background:var(--surface-2);border:1px solid var(--border-2);color:var(--text-md)}
+.btn-ghost:hover{background:var(--surface);color:var(--text-hi)}
 .btn-primary{background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff}
-.btn-primary:hover{transform:translateY(-1px);box-shadow:0 4px 15px rgba(99,102,241,.4)}
-.btn-danger{background:rgba(239,68,68,.8);color:#fff}
-.btn-danger:hover{background:rgba(239,68,68,1)}
-.btn:disabled{opacity:.45;cursor:not-allowed;transform:none!important}
-.link-btn{display:inline-flex;align-items:center;gap:5px;padding:8px 14px;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.12);color:#94a3b8;text-decoration:none;border-radius:7px;font-size:.87em;transition:all .2s}
-.link-btn:hover{background:rgba(255,255,255,.12);color:#e2e8f0}
-.msg{padding:11px 14px;border-radius:8px;margin:10px 0;display:none;font-size:.9em}
-.msg-success{background:rgba(52,211,153,.15);border:1px solid rgba(52,211,153,.3);color:#34d399}
-.msg-error{background:rgba(248,113,113,.15);border:1px solid rgba(248,113,113,.3);color:#f87171}
-.setup-box{background:rgba(99,102,241,.08);border:1px solid rgba(99,102,241,.25);border-radius:14px;padding:28px;text-align:center;color:#94a3b8}
-.setup-box h2{color:#a5b4fc;margin-bottom:12px;font-size:1.2em}
-.setup-box code{background:rgba(0,0,0,.3);padding:12px 16px;border-radius:8px;display:block;text-align:left;font-family:monospace;font-size:.88em;color:#cbd5e1;margin:12px 0;white-space:pre}
-.warn-bar{background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.35);border-radius:10px;padding:12px 18px;margin-bottom:16px;color:#fbbf24;font-size:.88em}
-.warn-bar code{background:rgba(0,0,0,.25);padding:1px 6px;border-radius:4px;font-family:monospace}
-.btn-export{display:inline-flex;align-items:center;gap:5px;padding:8px 16px;background:rgba(99,102,241,.15);border:1px solid rgba(99,102,241,.3);color:#a5b4fc;text-decoration:none;border-radius:8px;font-size:.9em;font-weight:600;transition:all .2s}
-.btn-export:hover{background:rgba(99,102,241,.25);color:#c7d2fe}
-@media(max-width:600px){.stats{gap:8px}.stat{padding:10px 14px}}
+.btn-primary:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 4px 14px rgba(99,102,241,.4)}
+.btn-danger{background:rgba(239,68,68,.85);color:#fff}
+.btn-danger:hover:not(:disabled){background:rgba(239,68,68,1)}
+.btn-success{background:rgba(52,211,153,.2);color:#34d399;border:1px solid rgba(52,211,153,.3)}
+.btn-warn{background:rgba(245,158,11,.15);color:#f59e0b;border:1px solid rgba(245,158,11,.3)}
+.btn-warn:hover:not(:disabled){background:rgba(245,158,11,.25)}
+.btn-sm{padding:4px 10px;font-size:.78em;border-radius:6px}
+
+/* ── Cards ───────────────────────────────────────────────────────────────── */
+.card{background:var(--surface);border:1px solid var(--border);
+      border-radius:14px;margin-bottom:10px;overflow:hidden;
+      transition:border-color .2s,box-shadow .2s}
+.card:hover{box-shadow:0 4px 20px var(--shadow)}
+.card.has-update{border-left:3px solid #f59e0b}
+.card.stopped-card{opacity:.7}
+
+/* card header — always visible, click to expand */
+.card-header{display:flex;justify-content:space-between;align-items:center;
+             padding:14px 18px;cursor:pointer;user-select:none;flex-wrap:wrap;gap:8px}
+.card-header:hover{background:var(--surface-2)}
+.card-left{display:flex;align-items:center;gap:10px}
+.chevron{color:var(--text-lo);font-size:.8em;transition:transform .25s;flex-shrink:0}
+.card.open .chevron{transform:rotate(90deg)}
+.cname{font-size:1.1em;font-weight:700;color:var(--text-hi)}
+.badges{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.badge{padding:4px 10px;border-radius:20px;font-size:.72em;font-weight:700;
+       text-transform:uppercase;letter-spacing:.04em}
+.b-running {background:rgba(52,211,153,.15);color:#34d399;border:1px solid rgba(52,211,153,.3)}
+.b-stopped {background:rgba(248,113,113,.15);color:#f87171;border:1px solid rgba(248,113,113,.3)}
+.b-update  {background:rgba(245,158,11,.15);color:#f59e0b;border:1px solid rgba(245,158,11,.3)}
+.b-strategy{background:rgba(99,102,241,.1);color:#a5b4fc;border:1px solid rgba(99,102,241,.2);font-size:.68em}
+
+/* card body — hidden when collapsed */
+.card-body{max-height:0;overflow:hidden;transition:max-height .3s ease}
+.card.open .card-body{max-height:2000px}
+.card-inner{padding:0 18px 18px}
+
+/* info grid */
+.info-block{background:rgba(0,0,0,.15);border-radius:10px;padding:12px 14px;margin-bottom:12px}
+[data-theme="light"] .info-block{background:rgba(0,0,0,.04)}
+.info-row{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin:6px 0}
+.lbl{font-weight:600;color:var(--text-lo);min-width:80px;font-size:.83em}
+.val{font-family:monospace;background:var(--val-bg);border:1px solid var(--val-border);
+     padding:2px 9px;border-radius:5px;font-size:.84em;color:var(--val-text)}
+.val.available{background:rgba(245,158,11,.12);border-color:rgba(245,158,11,.3);color:#fbbf24}
+
+/* version history */
+.history-block{margin-bottom:12px}
+.history-lbl{font-size:.75em;font-weight:700;text-transform:uppercase;letter-spacing:.07em;
+             color:var(--text-lo);margin-bottom:8px}
+.h-item{display:flex;align-items:center;gap:8px;padding:5px 0;
+        border-bottom:1px solid var(--border);flex-wrap:wrap}
+.h-item:last-child{border-bottom:none}
+.h-tag{font-family:monospace;font-size:.82em;color:var(--text-md);flex:1;min-width:120px}
+.h-date{font-size:.78em;color:var(--text-lo)}
+.h-pill{font-size:.7em;padding:2px 8px;border-radius:10px;font-weight:600}
+.h-deployed  {background:rgba(52,211,153,.1);color:#34d399}
+.h-rolled_back{background:rgba(245,158,11,.1);color:#f59e0b}
+.h-previous  {background:rgba(100,116,139,.1);color:var(--text-md)}
+
+/* action buttons row */
+.btns{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+
+/* feedback message */
+.msg{padding:10px 14px;border-radius:8px;margin-bottom:10px;display:none;font-size:.87em}
+.msg-ok {background:rgba(52,211,153,.15);border:1px solid rgba(52,211,153,.3);color:#34d399}
+.msg-err{background:rgba(248,113,113,.15);border:1px solid rgba(248,113,113,.3);color:#f87171}
+
+/* ── Progress modal ───────────────────────────────────────────────────────── */
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);
+         backdrop-filter:blur(4px);z-index:1000;
+         display:flex;align-items:center;justify-content:center;
+         opacity:0;pointer-events:none;transition:opacity .2s}
+.overlay.visible{opacity:1;pointer-events:all}
+.modal{background:var(--surface-2);border:1px solid var(--border-2);
+       border-radius:16px;width:min(560px,95vw);
+       display:flex;flex-direction:column;max-height:80vh;
+       box-shadow:0 20px 60px var(--shadow)}
+.modal-head{display:flex;align-items:center;gap:12px;padding:18px 20px;
+            border-bottom:1px solid var(--border)}
+.modal-icon{font-size:1.3em;flex-shrink:0}
+.modal-title-text{font-weight:700;color:var(--text-hi);font-size:1.05em}
+.modal-log{flex:1;overflow-y:auto;padding:14px 18px;font-family:monospace;
+           font-size:.82em;line-height:1.6;min-height:200px;max-height:50vh}
+.log-line{display:flex;gap:10px;margin:1px 0}
+.log-t{color:var(--text-lo);flex-shrink:0}
+.log-msg{color:var(--text-md)}
+.log-msg.warn{color:#f59e0b}
+.log-msg.error{color:#f87171}
+.modal-foot{padding:14px 20px;border-top:1px solid var(--border);
+            display:flex;justify-content:flex-end;gap:8px}
+
+/* ── Spinner ─────────────────────────────────────────────────────────────── */
+@keyframes spin{to{transform:rotate(360deg)}}
+.spinner{display:inline-block;width:18px;height:18px;
+         border:2px solid var(--border-2);border-top-color:var(--accent);
+         border-radius:50%;animation:spin .7s linear infinite;flex-shrink:0}
+
+/* ── Setup box (empty state) ─────────────────────────────────────────────── */
+.setup-box{background:rgba(99,102,241,.07);border:1px solid rgba(99,102,241,.2);
+           border-radius:14px;padding:28px;text-align:center;color:var(--text-md)}
+.setup-box h2{color:#a5b4fc;margin-bottom:10px}
+.setup-box pre{background:var(--code-bg);padding:12px 16px;border-radius:8px;
+               text-align:left;font-size:.85em;color:var(--val-text);
+               margin:12px 0;overflow-x:auto}
+
+/* ── Responsive ──────────────────────────────────────────────────────────── */
+@media(max-width:680px){
+  .stat-grid{grid-template-columns:repeat(2,1fr)}
+  .dash-info-row{grid-template-columns:1fr}
+}
+@media(max-width:420px){
+  .stat-grid{grid-template-columns:repeat(2,1fr)}
+  .card-header{padding:12px 14px}
+  .card-inner{padding:0 14px 14px}
+}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <div class="hdr">
-    <h1>&#x1F433; {{ title }}</h1>
-    <p class="tagline">Docker Update Made Manageable, Yay!</p>
-    <p class="sub">Monitoring <span>{{ containers|length }}</span> container(s) &nbsp;&middot;&nbsp; checks every <span>{{ check_interval_h }}</span></p>
-    <div class="stats">
-      <div class="stat"><div class="stat-num">{{ containers|length }}</div><div class="stat-lbl">Monitored</div></div>
-      <div class="stat"><div class="stat-num">{{ updates_count }}</div><div class="stat-lbl">Updates Ready</div></div>
-      <div class="stat"><div class="stat-num">{{ running_count }}</div><div class="stat-lbl">Running</div></div>
+
+  <!-- ── Dashboard ────────────────────────────────────────────────────────── -->
+  <div class="dash">
+    <div class="dash-title-row">
+      <div class="dash-title">
+        <h1>&#x1F433; {{ title }}</h1>
+        <p>Docker Update Made Manageable, Yay!</p>
+      </div>
+      <div class="dash-controls">
+        <button class="btn btn-ghost" id="btn-theme" onclick="toggleTheme()">&#9788; Light</button>
+      </div>
+    </div>
+
+    <!-- Stat cards -->
+    <div class="stat-grid">
+      <div class="stat-card">
+        <div class="stat-num">{{ containers|length }}</div>
+        <div class="stat-lbl">Monitored</div>
+      </div>
+      <div class="stat-card {% if updates_count > 0 %}has-updates{% endif %}">
+        <div class="stat-num">{{ updates_count }}</div>
+        <div class="stat-lbl">Updates Ready</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-num">{{ running_count }}</div>
+        <div class="stat-lbl">Running</div>
+      </div>
+      <div class="stat-card {% if updates_count == 0 and containers|length > 0 %}all-good{% endif %}">
+        <div class="stat-num">{{ containers|length - updates_count }}</div>
+        <div class="stat-lbl">Up to Date</div>
+      </div>
+    </div>
+
+    <!-- Config + timing row -->
+    <div class="dash-info-row">
+      <!-- Config flags -->
+      <div class="dash-panel">
+        <div class="dash-panel-lbl">Configuration</div>
+        <div class="flags">
+          <span class="flag {{ 'flag-on' if allow_prerelease else 'flag-off' }}">
+            Pre-releases {{ 'ON' if allow_prerelease else 'OFF' }}
+          </span>
+          <span class="flag {{ 'flag-on' if auto_update else 'flag-off' }}">
+            Auto-update {{ 'ON' if auto_update else 'OFF' }}
+          </span>
+          <span class="flag {{ 'flag-on' if ntfy_enabled else 'flag-off' }}">
+            Notifications {{ 'ON' if ntfy_enabled else 'OFF' }}
+          </span>
+          <span class="flag {{ 'flag-ok' if persistent else 'flag-warn' }}">
+            Persistence {{ 'OK' if persistent else 'WARNING' }}
+          </span>
+          <span class="flag flag-off">
+            History {{ history_limit }} versions
+          </span>
+        </div>
+      </div>
+
+      <!-- Timing + actions -->
+      <div class="dash-panel">
+        <div class="dash-panel-lbl">Update Checks (every {{ check_interval_h }})</div>
+        <div class="timing">
+          <div class="timing-row">
+            <span class="t-icon">&#x23F0;</span>
+            <span>Last checked:</span>
+            <span class="t-val" id="last-checked">Loading...</span>
+          </div>
+          <div class="timing-row">
+            <span class="t-icon">&#x23F3;</span>
+            <span>Next check in:</span>
+            <span class="t-val" id="next-check">Loading...</span>
+          </div>
+        </div>
+        <div class="action-row">
+          <button class="btn btn-primary" id="btn-check" onclick="checkNow()">
+            <span id="check-icon">&#8635;</span> Check Now
+          </button>
+          <a class="btn btn-ghost" href="/api/history/export" download="dummy-history.json">
+            &#x2193; Export History
+          </a>
+        </div>
+      </div>
     </div>
   </div>
-  <div class="cfg-bar">
-    <span>Pre-releases: <span class="{{ 'cfg-on' if allow_prerelease else 'cfg-off' }}">{{ 'ON' if allow_prerelease else 'OFF' }}</span></span>
-    <span>Auto-update: <span class="{{ 'cfg-on' if auto_update else 'cfg-off' }}">{{ 'ON' if auto_update else 'OFF' }}</span></span>
-    <span>Notifications: <span class="{{ 'cfg-on' if ntfy_enabled else 'cfg-off' }}">{{ 'ON' if ntfy_enabled else 'OFF' }}</span></span>
-    <span>History: <span>{{ history_limit }} versions</span></span>
-  </div>
+
   {% if not persistent %}
   <div class="warn-bar">
-    &#9888; <strong>Persistence warning:</strong> The <code>/data</code> directory does not appear
-    to be a bind-mounted host volume. Version history and rollback data will be lost on restart.
-    Mount <code>/stacks/data/dummy:/data</code> in your compose.yaml to fix this.
+    &#9888; <strong>Persistence warning:</strong> <code>/data</code> is not bind-mounted.
+    History and rollback data will be lost on restart.
+    Add <code>- /stacks/data/dummy:/data</code> to your compose volumes.
   </div>
   {% endif %}
 
-  <div class="refresh-row">
-    <button class="btn-refresh" onclick="location.reload()">&#8635; Refresh</button>
-    <a class="btn-export" href="/api/history/export" download="dummy-history.json">&#x2193; Export History</a>
-  </div>
+  <!-- ── Container cards ──────────────────────────────────────────────────── -->
   {% if containers %}
     {% for u in containers %}
-    <div class="card {% if u.has_update %}has-update{% endif %}">
-      <div class="card-row">
-        <span class="cname">{{ u.container }}</span>
+    <div class="card {% if u.has_update %}has-update{% endif %} {% if u.status != 'running' %}stopped-card{% endif %}"
+         id="card-{{ u.container }}">
+
+      <!-- Always-visible header -->
+      <div class="card-header" onclick="toggleCard('{{ u.container }}')">
+        <div class="card-left">
+          <span class="chevron">&#9654;</span>
+          <span class="cname">{{ u.container }}</span>
+        </div>
         <div class="badges">
-          <span class="badge {{ u.status }}">{{ u.status }}</span>
-          <span class="badge badge-strategy">{{ u.strategy_label }}</span>
-          {% if u.has_update %}<span class="badge badge-update">&#x2B06; Update Available</span>{% endif %}
+          <span class="badge {{ 'b-running' if u.status == 'running' else 'b-stopped' }}">
+            {{ u.status }}
+          </span>
+          <span class="badge b-strategy">{{ u.strategy_label }}</span>
+          {% if u.has_update %}
+          <span class="badge b-update">&#x2B06; {{ u.available_tag }}</span>
+          {% endif %}
         </div>
       </div>
-      <div class="info">
-        <div class="info-row"><span class="lbl">Image</span><span class="val">{{ u.image }}</span></div>
-        <div class="info-row"><span class="lbl">Current</span><span class="val">{{ u.current_tag }}</span></div>
-        {% if u.available_tag %}<div class="info-row"><span class="lbl">Available</span><span class="val new">{{ u.available_tag }}</span></div>{% endif %}
-        {% if u.history %}
-        <div class="history">
-          <div class="history-title">Version History</div>
-          {% for h in u.history %}
-          <div class="h-item">
-            <span class="h-tag">{{ h.tag }}</span>
-            <span class="h-date">{{ h.date[:10] }}</span>
-            <span class="h-status h-{{ h.status }}">{{ h.status }}</span>
+
+      <!-- Collapsible body -->
+      <div class="card-body">
+        <div class="card-inner">
+
+          <!-- Info -->
+          <div class="info-block">
+            <div class="info-row">
+              <span class="lbl">Image</span>
+              <span class="val">{{ u.image }}</span>
+            </div>
+            <div class="info-row">
+              <span class="lbl">Current</span>
+              <span class="val">{{ u.current_tag }}</span>
+            </div>
+            {% if u.available_tag %}
+            <div class="info-row">
+              <span class="lbl">Available</span>
+              <span class="val available">{{ u.available_tag }}</span>
+            </div>
+            {% endif %}
           </div>
-          {% endfor %}
+
+          <!-- Version history with per-entry rollback -->
+          {% if u.history %}
+          <div class="history-block">
+            <div class="history-lbl">Version History</div>
+            {% for h in u.history %}
+            <div class="h-item">
+              <span class="h-tag">{{ h.tag }}</span>
+              <span class="h-date">{{ h.date[:10] }}</span>
+              <span class="h-pill h-{{ h.status }}">{{ h.status }}</span>
+              {% if not loop.first %}
+              <button class="btn btn-warn btn-sm"
+                      onclick="rollbackTo('{{ u.container }}','{{ h.tag }}')">
+                &#x21A9; Restore
+              </button>
+              {% endif %}
+            </div>
+            {% endfor %}
+          </div>
+          {% endif %}
+
+          <!-- Messages -->
+          <div class="msg msg-ok"  id="msg-ok-{{ u.container }}"></div>
+          <div class="msg msg-err" id="msg-err-{{ u.container }}"></div>
+
+          <!-- Action buttons -->
+          <div class="btns">
+            {% if u.has_update and not auto_update %}
+            <button class="btn btn-primary"
+                    id="btn-upd-{{ u.container }}"
+                    onclick="doUpdate('{{ u.container }}','{{ u.available_tag }}')">
+              &#x2B06; Update to {{ u.available_tag }}
+            </button>
+            {% endif %}
+            {% if u.changelog %}
+            <a class="btn btn-ghost"
+               href="{{ u.changelog }}" target="_blank" rel="noopener">
+              &#x1F4DD; Changelog
+            </a>
+            {% endif %}
+          </div>
+
         </div>
-        {% endif %}
-      </div>
-      <div class="msg msg-success" id="success-{{ u.container }}"></div>
-      <div class="msg msg-error" id="error-{{ u.container }}"></div>
-      <div class="btns">
-        {% if u.has_update and not auto_update %}
-        <button class="btn btn-primary" onclick="updateService('{{ u.container }}','{{ u.available_tag }}')" id="btn-update-{{ u.container }}">
-          &#x2B06; Update to {{ u.available_tag }}
-        </button>
-        {% endif %}
-        {% if u.history|length > 1 %}
-        <button class="btn btn-danger" onclick="rollbackService('{{ u.container }}')" id="btn-rollback-{{ u.container }}">
-          &#x21A9; Rollback to {{ u.history[1].tag }}
-        </button>
-        {% endif %}
-        {% if u.changelog %}<a class="link-btn" href="{{ u.changelog }}" target="_blank" rel="noopener">&#x1F4DD; Changelog</a>{% endif %}
       </div>
     </div>
     {% endfor %}
+
   {% else %}
     <div class="setup-box">
-      <h2>No containers being monitored yet</h2>
-      <p>Add the <strong>dummy.enable=true</strong> label to any service you want DUMMY to track. That's it.</p>
-      <code>services:
+      <h2>No containers monitored yet</h2>
+      <p>Add <strong>dummy.enable=true</strong> to any service. That's all that's required.</p>
+      <pre>services:
   radarr:
     image: lscr.io/linuxserver/radarr:5.2.1
     labels:
-      - dummy.enable=true     # minimum required
-
-      # Optional: also update the image tag in your compose file
-      - dummy.compose_file=/compose/docker-compose.yml
-
-      # Optional: also update a variable in a .env file
-      - dummy.env_var=RADARR_VER
-
-      # Optional: override the changelog link
-      - dummy.changelog=https://github.com/Radarr/Radarr/releases</code>
-      <p style="margin-top:12px;font-size:.9em">See the README for full setup options.</p>
+      - dummy.enable=true            # required
+      - dummy.env_var=RADARR_VER    # optional: keep .env in sync
+      - dummy.compose_file=/compose/docker-compose.yml  # optional</pre>
     </div>
   {% endif %}
+
 </div>
+
+<!-- ── Progress modal ──────────────────────────────────────────────────────── -->
+<div class="overlay" id="overlay">
+  <div class="modal">
+    <div class="modal-head">
+      <span class="modal-icon" id="modal-icon"><div class="spinner"></div></span>
+      <span class="modal-title-text" id="modal-title">Working...</span>
+    </div>
+    <div class="modal-log" id="modal-log"></div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="modal-close" disabled onclick="closeModal()">
+        Close &amp; Refresh
+      </button>
+    </div>
+  </div>
+</div>
+
 <script>
-function showMsg(c,t,x){
-  const s=document.getElementById('success-'+c),e=document.getElementById('error-'+c);
-  s.style.display=e.style.display='none';
-  const el=t==='success'?s:e;el.textContent=x;el.style.display='block';
-  setTimeout(()=>el.style.display='none',12000);
+// ── Theme ──────────────────────────────────────────────────────────────────
+function initTheme(){
+  const t = localStorage.getItem('dummy-theme') || 'dark';
+  applyTheme(t);
 }
-async function updateService(c,t){
-  const b=document.getElementById('btn-update-'+c);
-  b.disabled=true;b.textContent='Updating...';
-  try{
-    const r=await fetch('/api/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({container:c,tag:t})});
-    const d=await r.json();
-    if(d.success){showMsg(c,'success',d.message);setTimeout(()=>location.reload(),2500)}
-    else{showMsg(c,'error',d.error);b.disabled=false;b.textContent='Update to '+t}
-  }catch(err){showMsg(c,'error','Network error: '+err.message);b.disabled=false;b.textContent='Update to '+t}
+function applyTheme(t){
+  document.documentElement.setAttribute('data-theme', t);
+  const btn = document.getElementById('btn-theme');
+  if(btn) btn.textContent = t === 'dark' ? '\u2600 Light' : '\u263D Dark';
+  localStorage.setItem('dummy-theme', t);
 }
-async function rollbackService(c){
-  if(!confirm('Roll back '+c+' to the previous version?'))return;
-  const b=document.getElementById('btn-rollback-'+c);
-  b.disabled=true;b.textContent='Rolling back...';
-  try{
-    const r=await fetch('/api/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({container:c})});
-    const d=await r.json();
-    if(d.success){showMsg(c,'success',d.message);setTimeout(()=>location.reload(),2500)}
-    else{showMsg(c,'error',d.error);b.disabled=false;b.textContent='Rollback'}
-  }catch(err){showMsg(c,'error','Network error: '+err.message);b.disabled=false;b.textContent='Rollback'}
+function toggleTheme(){
+  const cur = document.documentElement.getAttribute('data-theme');
+  applyTheme(cur === 'dark' ? 'light' : 'dark');
 }
+
+// ── Status polling (last checked / next check countdown) ───────────────────
+let _nextCheckTs = 0;
+let _countdownTick;
+
+function initStatus(){
+  fetchStatus();
+  setInterval(fetchStatus, 30000);
+  _countdownTick = setInterval(tickCountdown, 1000);
+}
+
+async function fetchStatus(){
+  try {
+    const r = await fetch('/api/status');
+    const d = await r.json();
+    _nextCheckTs = d.next_check_time * 1000;
+    const el = document.getElementById('last-checked');
+    if(el) el.textContent = d.last_check_time ? ago(d.last_check_time * 1000) : 'Never';
+    tickCountdown();
+  } catch(e){}
+}
+
+function tickCountdown(){
+  const el = document.getElementById('next-check');
+  if(!el) return;
+  if(!_nextCheckTs){ el.textContent = '—'; return; }
+  const ms = _nextCheckTs - Date.now();
+  if(ms <= 0){ el.textContent = 'Soon...'; return; }
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  const s = Math.floor((ms % 60000) / 1000);
+  el.textContent = h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${s}s` : `${s}s`;
+}
+
+function ago(ts){
+  const ms = Date.now() - ts;
+  const m = Math.floor(ms / 60000);
+  const h = Math.floor(m / 60);
+  if(h > 0) return `${h}h ${m % 60}m ago`;
+  if(m > 0) return `${m}m ago`;
+  return 'Just now';
+}
+
+// ── Card collapsing ─────────────────────────────────────────────────────────
+function toggleCard(name){
+  const card = document.getElementById('card-' + name);
+  if(card) card.classList.toggle('open');
+}
+
+function initCards(){
+  // Auto-expand cards that have updates
+  document.querySelectorAll('.card.has-update').forEach(c => c.classList.add('open'));
+}
+
+// ── Check Now ───────────────────────────────────────────────────────────────
+async function checkNow(){
+  const btn = document.getElementById('btn-check');
+  const icon = document.getElementById('check-icon');
+  btn.disabled = true;
+  icon.innerHTML = '<div class="spinner" style="width:14px;height:14px;display:inline-block"></div>';
+
+  openModal('Checking for updates...');
+
+  try {
+    const r = await fetch('/api/check', {method:'POST'});
+    const d = await r.json();
+    const jobId = d.job_id;
+    if(jobId){
+      await pollJob(jobId);
+    }
+  } catch(e){
+    appendLog('Error: ' + e.message, 'error');
+  }
+
+  btn.disabled = false;
+  icon.textContent = '\u21BB';
+  fetchStatus();
+}
+
+// ── Update ──────────────────────────────────────────────────────────────────
+async function doUpdate(container, tag){
+  openModal(`Updating ${container} \u2192 ${tag}`);
+  try {
+    const r = await fetch('/api/update', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({container, tag})
+    });
+    const d = await r.json();
+    if(d.job_id){
+      const result = await pollJob(d.job_id);
+      if(result && result.success){
+        modalDone(true, result.message || 'Update complete');
+      } else {
+        modalDone(false, result ? result.error : 'Unknown error');
+      }
+    }
+  } catch(e){
+    modalDone(false, 'Network error: ' + e.message);
+  }
+}
+
+// ── Rollback ────────────────────────────────────────────────────────────────
+async function rollbackTo(container, tag){
+  if(!confirm(`Restore ${container} to ${tag}?`)) return;
+  openModal(`Restoring ${container} \u2192 ${tag}`);
+  try {
+    const r = await fetch('/api/rollback', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({container, tag})
+    });
+    const d = await r.json();
+    if(d.job_id){
+      const result = await pollJob(d.job_id);
+      if(result && result.success){
+        modalDone(true, result.message || 'Rollback complete');
+      } else {
+        modalDone(false, result ? result.error : 'Unknown error');
+      }
+    }
+  } catch(e){
+    modalDone(false, 'Network error: ' + e.message);
+  }
+}
+
+// ── Job polling ─────────────────────────────────────────────────────────────
+let _lastLogCount = 0;
+
+async function pollJob(jobId){
+  _lastLogCount = 0;
+  return new Promise(resolve => {
+    const iv = setInterval(async () => {
+      try {
+        const r = await fetch('/api/jobs/' + jobId);
+        const d = await r.json();
+
+        // Append any new log lines
+        const newLines = d.log.slice(_lastLogCount);
+        newLines.forEach(l => appendLog(l.msg, l.lvl));
+        _lastLogCount = d.log.length;
+
+        if(d.done){
+          clearInterval(iv);
+          resolve(d);
+        }
+      } catch(e){
+        clearInterval(iv);
+        resolve(null);
+      }
+    }, 800);
+  });
+}
+
+// ── Modal ────────────────────────────────────────────────────────────────────
+function openModal(title){
+  document.getElementById('modal-title').textContent = title;
+  document.getElementById('modal-icon').innerHTML = '<div class="spinner"></div>';
+  document.getElementById('modal-log').innerHTML = '';
+  document.getElementById('modal-close').disabled = true;
+  document.getElementById('overlay').classList.add('visible');
+  _lastLogCount = 0;
+}
+
+function appendLog(msg, level){
+  const log = document.getElementById('modal-log');
+  const line = document.createElement('div');
+  line.className = 'log-line';
+  const now = new Date();
+  const t = [now.getHours(), now.getMinutes(), now.getSeconds()]
+    .map(n => String(n).padStart(2,'0')).join(':');
+  line.innerHTML = `<span class="log-t">${t}</span><span class="log-msg ${level||''}">${escHtml(msg)}</span>`;
+  log.appendChild(line);
+  log.scrollTop = log.scrollHeight;
+}
+
+function modalDone(success, msg){
+  document.getElementById('modal-icon').textContent = success ? '\u2705' : '\u274C';
+  if(msg) appendLog(msg, success ? 'info' : 'error');
+  const close = document.getElementById('modal-close');
+  close.disabled = false;
+  close.textContent = success ? 'Close & Refresh' : 'Close';
+  if(success){
+    close.className = 'btn btn-primary';
+  }
+}
+
+function closeModal(){
+  document.getElementById('overlay').classList.remove('visible');
+  // Only reload if an update actually ran (not just a check)
+  const icon = document.getElementById('modal-icon').textContent;
+  if(icon === '\u2705') location.reload();
+}
+
+// Close modal on overlay click
+document.getElementById('overlay').addEventListener('click', function(e){
+  if(e.target === this && !document.getElementById('modal-close').disabled){
+    closeModal();
+  }
+});
+
+function escHtml(s){
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Init ─────────────────────────────────────────────────────────────────────
+initTheme();
+initCards();
+initStatus();
 </script>
 </body>
 </html>"""
 
 
-def _check_persistence() -> bool:
-    """Return True if /data looks like a bind-mounted host volume."""
-    try:
-        db_dir = os.path.dirname(DB_PATH)
-        data_dev   = os.stat(db_dir).st_dev
-        parent_dev = os.stat(os.path.dirname(db_dir.rstrip("/"))).st_dev
-        return data_dev != parent_dev
-    except Exception:
-        return True  # assume OK if we can't tell
-
+# ---------------------------------------------------------------------------
+# Flask routes
+# ---------------------------------------------------------------------------
 
 @app.route("/")
 def index():
@@ -1013,11 +1596,43 @@ def index():
     interval_h    = f"{CHECK_INTERVAL // 3600}h" if CHECK_INTERVAL >= 3600 else f"{CHECK_INTERVAL // 60}m"
     for c in containers:
         c.pop("_strategy_cfg", None)
-    return render_template_string(HTML, containers=containers, updates_count=updates_count,
-        running_count=running_count, title=WEB_TITLE, check_interval_h=interval_h,
-        allow_prerelease=ALLOW_PRERELEASE, auto_update=AUTO_UPDATE,
-        ntfy_enabled=bool(NTFY_ENDPOINT), history_limit=HISTORY_LIMIT,
-        persistent=_check_persistence())
+    return render_template_string(
+        HTML,
+        containers    = containers,
+        updates_count = updates_count,
+        running_count = running_count,
+        title         = WEB_TITLE,
+        check_interval_h = interval_h,
+        allow_prerelease = ALLOW_PRERELEASE,
+        auto_update      = AUTO_UPDATE,
+        ntfy_enabled     = bool(NTFY_ENDPOINT),
+        history_limit    = HISTORY_LIMIT,
+        persistent       = _check_persistence(),
+    )
+
+
+@app.route("/api/status")
+def api_status():
+    return jsonify({
+        "last_check_time":  _last_check_time,
+        "next_check_time":  _next_check_time,
+        "check_interval":   CHECK_INTERVAL,
+    })
+
+
+@app.route("/api/jobs/<job_id>")
+def api_job(job_id):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    return jsonify({
+        "done":    job["done"],
+        "success": job["success"],
+        "error":   job["error"],
+        "message": job["message"],
+        "log":     job["log"],
+    })
 
 
 @app.route("/api/update", methods=["POST"])
@@ -1026,16 +1641,49 @@ def api_update():
     container, tag = data.get("container"), data.get("tag")
     if not container or not tag:
         return jsonify({"success": False, "error": "Missing parameters"})
-    return jsonify(update_service(container, tag))
+
+    job_id = _new_job()
+
+    def run():
+        result = update_service(container, tag, job_id=job_id)
+        _job_done(job_id, result.get("success", False),
+                  message=result.get("message",""),
+                  error=result.get("error",""))
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"job_id": job_id})
 
 
 @app.route("/api/rollback", methods=["POST"])
 def api_rollback():
     data = request.json or {}
-    container = data.get("container")
+    container  = data.get("container")
+    target_tag = data.get("tag")
     if not container:
         return jsonify({"success": False, "error": "Missing container"})
-    return jsonify(rollback_service(container, data.get("tag")))
+
+    job_id = _new_job()
+
+    def run():
+        result = rollback_service(container, target_tag, job_id=job_id)
+        _job_done(job_id, result.get("success", False),
+                  message=result.get("message",""),
+                  error=result.get("error",""))
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/api/check", methods=["POST"])
+def api_check():
+    job_id = _new_job()
+
+    def run():
+        _check_once(job_id=job_id)
+        _job_done(job_id, True, message="Check complete")
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"success": True, "job_id": job_id})
 
 
 @app.route("/api/containers")
@@ -1046,21 +1694,8 @@ def api_containers():
     return jsonify(items)
 
 
-@app.route("/api/check", methods=["POST"])
-def api_check():
-    threading.Thread(target=_check_once, daemon=True).start()
-    return jsonify({"success": True, "message": "Check triggered"})
-
-
-@app.route("/health")
-def health():
-    return jsonify({"status": "ok", "containers_monitored": len(get_monitored_containers())})
-
-
-
 @app.route("/api/history/export")
 def api_history_export():
-    """Download the full version history as a JSON file — useful before migrations."""
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -1068,10 +1703,8 @@ def api_history_export():
         rows = c.fetchall()
         conn.close()
         data = [{"container": r[0], "tag": r[1], "deployed_at": r[2], "status": r[3]} for r in rows]
-        from flask import Response
-        import json as _json
         return Response(
-            _json.dumps({"exported_at": datetime.now().isoformat(), "history": data}, indent=2),
+            json.dumps({"exported_at": datetime.now().isoformat(), "history": data}, indent=2),
             mimetype="application/json",
             headers={"Content-Disposition": "attachment; filename=dummy-history.json"}
         )
@@ -1082,42 +1715,29 @@ def api_history_export():
 
 @app.route("/api/history/import", methods=["POST"])
 def api_history_import():
-    """
-    Restore version history from a previously exported JSON file.
-    Existing entries for the same container+deployed_at are skipped (safe to re-import).
-    Body: the JSON produced by /api/history/export
-    """
     try:
         data = request.json or {}
         rows = data.get("history", [])
         if not rows:
-            return jsonify({"success": False, "error": "No history entries found in payload"})
-
+            return jsonify({"success": False, "error": "No history entries in payload"})
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        inserted = 0
-        skipped = 0
+        inserted = skipped = 0
         for row in rows:
             try:
                 c.execute(
                     """INSERT INTO version_history (container, tag, deployed_at, status)
-                       SELECT ?, ?, ?, ?
-                       WHERE NOT EXISTS (
-                           SELECT 1 FROM version_history
-                           WHERE container=? AND deployed_at=?
-                       )""",
+                       SELECT ?,?,?,? WHERE NOT EXISTS (
+                           SELECT 1 FROM version_history WHERE container=? AND deployed_at=?)""",
                     (row["container"], row["tag"], row["deployed_at"], row["status"],
                      row["container"], row["deployed_at"])
                 )
-                if c.rowcount:
-                    inserted += 1
-                else:
-                    skipped += 1
+                if c.rowcount: inserted += 1
+                else: skipped += 1
             except Exception:
                 skipped += 1
         conn.commit()
         conn.close()
-        log.info("History import: %d inserted, %d skipped", inserted, skipped)
         return jsonify({"success": True, "inserted": inserted, "skipped": skipped})
     except Exception as exc:
         log.error("api_history_import: %s", exc)
@@ -1126,14 +1746,22 @@ def api_history_import():
 
 @app.route("/api/history/<container>")
 def api_container_history(container):
-    """Return the full version history for a single container."""
     return jsonify(get_history(container))
 
 
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "containers_monitored": len(get_monitored_containers())})
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     log.info("=== DUMMY - Docker Update Made Manageable, Yay! ===")
     log.info("Allow prerelease: %s | Auto-update: %s | Check interval: %ds",
              ALLOW_PRERELEASE, AUTO_UPDATE, CHECK_INTERVAL)
     init_db()
+    _next_check_time = time.time() + CHECK_INTERVAL
     threading.Thread(target=check_for_updates, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT, debug=False)
