@@ -1,0 +1,112 @@
+services:
+
+  # ============================================================
+  # DUMMY - the update manager itself
+  # ============================================================
+  dummy:
+    image: donald-win/dummy:latest
+    container_name: dummy
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    volumes:
+      # Always required - Docker socket
+      - /var/run/docker.sock:/var/run/docker.sock
+
+      # Required for Mode 2 (compose-file strategy)
+      - /path/to/your/docker-compose.yml:/compose/docker-compose.yml
+
+      # Required for Mode 3 (env-file strategy)
+      - /path/to/your/.env:/env/.env
+
+      # Recommended - persists version history
+      - /path/to/data/dummy:/data
+
+    environment:
+      - TZ=Pacific/Auckland
+      - ALLOW_PRERELEASE=false
+      - AUTO_UPDATE=false
+      - CHECK_INTERVAL=21600
+      # - HEALTH_CHECK_TIMEOUT=60
+      # - HISTORY_LIMIT=5
+      # - NTFY_ENDPOINT=http://ntfy:80
+      # - NTFY_TOPIC=DockerUpdate
+      # - NTFY_TOKEN=tk_xxxxxxxxxxxxxxxxxxxx
+      # - NTFY_CLICK_URL=http://dummy.yourdomain.com
+      # - GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
+      # - CHANGELOG_URLS=myapp=https://github.com/me/myapp/releases
+      # - VERSION_VARS=radarr=RADARR_VER,sonarr=SONARR_VER  # backward compat
+      # - WEB_TITLE=DUMMY
+      # - LOG_LEVEL=INFO
+
+    networks:
+      - docker-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+
+  # ============================================================
+  # MODE 1 - Label only (simplest, no files needed)
+  # DUMMY detects the image, pulls the update, and recreates
+  # the container via the Docker API automatically.
+  # ============================================================
+  radarr:
+    image: lscr.io/linuxserver/radarr:5.2.1
+    container_name: radarr
+    restart: unless-stopped
+    labels:
+      - dummy.enable=true          # <-- that's it
+
+
+  # ============================================================
+  # MODE 2 - Compose file editing
+  # DUMMY edits the image tag in this file and runs
+  # docker compose up -d to apply the change.
+  # Mount the compose file into the DUMMY container (see above).
+  # ============================================================
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:4.0.16.2944
+    container_name: sonarr
+    restart: unless-stopped
+    labels:
+      - dummy.enable=true
+      - dummy.compose_file=/compose/docker-compose.yml
+      # - dummy.compose_service=sonarr   # defaults to container name
+
+
+  # ============================================================
+  # MODE 3 - Env file editing
+  # DUMMY updates a variable in your .env and restarts the
+  # container. Mount the .env into the DUMMY container.
+  # ============================================================
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:2.3.0.5236
+    container_name: prowlarr
+    restart: unless-stopped
+    labels:
+      - dummy.enable=true
+      - dummy.env_var=PROWLARR_VER    # variable name in your .env
+
+
+  # ============================================================
+  # Modes can be combined - DUMMY will keep both files in sync
+  # ============================================================
+  homepage:
+    image: ghcr.io/gethomepage/homepage:V1.10.1
+    container_name: homepage
+    restart: unless-stopped
+    labels:
+      - dummy.enable=true
+      - dummy.env_var=HOMEPAGE_VER
+      - dummy.compose_file=/compose/docker-compose.yml
+      - dummy.changelog=https://github.com/gethomepage/homepage/releases
+
+
+networks:
+  docker-net:
+    external: true
+    name: docker-net
