@@ -234,27 +234,3 @@ No extra config needed for any of these.
 
 Every update and rollback is gated by a health check. If the container doesn't become healthy within `HEALTH_CHECK_TIMEOUT` seconds, DUMMY automatically reverts to the previous version and sends a notification. The previous image is always retained locally so rollbacks are instant.
 
----
-
-## Building & publishing
-
-```bash
-docker build -t donald-win/dummy:latest .
-docker tag donald-win/dummy:latest donald-win/dummy:1.0.0
-docker push donald-win/dummy:latest
-docker push donald-win/dummy:1.0.0
-```
-
-Multi-arch (amd64 + arm64 + armv7):
-```bash
-docker buildx build \
-  --platform linux/amd64,linux/arm64,linux/arm/v7 \
-  -t donald-win/dummy:latest \
-  --push .
-```
-
----
-
-## License
-
-MIT
