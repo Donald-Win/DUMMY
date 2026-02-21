@@ -24,8 +24,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # --------------------------------------------------------------------------
 COPY app.py .
 
-# Persistent data volume (SQLite database)
-VOLUME ["/data"]
+# /data is where the SQLite database lives.
+# Do NOT use VOLUME here — the VOLUME instruction creates an anonymous Docker
+# volume that can shadow the bind mount declared in compose.yaml, causing the
+# database to be written to Docker-managed storage instead of the host path.
+# Instead, always mount /data explicitly in your compose file:
+#   volumes:
+#     - /stacks/data/dummy:/data
+RUN mkdir -p /data
 
 EXPOSE 5000
 

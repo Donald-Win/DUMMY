@@ -249,7 +249,30 @@ def get_changelog(image: str, label_override: str = None):
 # ---------------------------------------------------------------------------
 
 def init_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    db_dir = os.path.dirname(DB_PATH)
+    os.makedirs(db_dir, exist_ok=True)
+
+    # Persistence check — warn loudly if /data looks like it is NOT a bind mount.
+    # A bind mount will have a different device ID than its parent directory.
+    # If they match, the directory is on the container overlay filesystem and
+    # data will be lost on every container recreate.
+    try:
+        import stat
+        data_dev  = os.stat(db_dir).st_dev
+        parent_dev = os.stat(os.path.dirname(db_dir.rstrip("/"))).st_dev
+        if data_dev == parent_dev:
+            log.warning("=" * 60)
+            log.warning("PERSISTENCE WARNING: %s does not appear to be a", db_dir)
+            log.warning("bind-mounted host directory. Version history and")
+            log.warning("rollback data will be LOST when the container restarts.")
+            log.warning("Add this to your compose.yaml under dummy volumes:")
+            log.warning("  - /stacks/data/dummy:/data")
+            log.warning("=" * 60)
+        else:
+            log.info("Persistence OK — %s is a bind-mounted volume.", db_dir)
+    except Exception as exc:
+        log.warning("Could not verify persistence of %s: %s", db_dir, exc)
+
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS version_history (
@@ -834,6 +857,10 @@ h1{color:#e2e8f0;font-size:1.8em;margin-bottom:4px}
 .setup-box{background:rgba(99,102,241,.08);border:1px solid rgba(99,102,241,.25);border-radius:14px;padding:28px;text-align:center;color:#94a3b8}
 .setup-box h2{color:#a5b4fc;margin-bottom:12px;font-size:1.2em}
 .setup-box code{background:rgba(0,0,0,.3);padding:12px 16px;border-radius:8px;display:block;text-align:left;font-family:monospace;font-size:.88em;color:#cbd5e1;margin:12px 0;white-space:pre}
+.warn-bar{background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.35);border-radius:10px;padding:12px 18px;margin-bottom:16px;color:#fbbf24;font-size:.88em}
+.warn-bar code{background:rgba(0,0,0,.25);padding:1px 6px;border-radius:4px;font-family:monospace}
+.btn-export{display:inline-flex;align-items:center;gap:5px;padding:8px 16px;background:rgba(99,102,241,.15);border:1px solid rgba(99,102,241,.3);color:#a5b4fc;text-decoration:none;border-radius:8px;font-size:.9em;font-weight:600;transition:all .2s}
+.btn-export:hover{background:rgba(99,102,241,.25);color:#c7d2fe}
 @media(max-width:600px){.stats{gap:8px}.stat{padding:10px 14px}}
 </style>
 </head>
@@ -855,8 +882,17 @@ h1{color:#e2e8f0;font-size:1.8em;margin-bottom:4px}
     <span>Notifications: <span class="{{ 'cfg-on' if ntfy_enabled else 'cfg-off' }}">{{ 'ON' if ntfy_enabled else 'OFF' }}</span></span>
     <span>History: <span>{{ history_limit }} versions</span></span>
   </div>
+  {% if not persistent %}
+  <div class="warn-bar">
+    &#9888; <strong>Persistence warning:</strong> The <code>/data</code> directory does not appear
+    to be a bind-mounted host volume. Version history and rollback data will be lost on restart.
+    Mount <code>/stacks/data/dummy:/data</code> in your compose.yaml to fix this.
+  </div>
+  {% endif %}
+
   <div class="refresh-row">
     <button class="btn-refresh" onclick="location.reload()">&#8635; Refresh</button>
+    <a class="btn-export" href="/api/history/export" download="dummy-history.json">&#x2193; Export History</a>
   </div>
   {% if containers %}
     {% for u in containers %}
@@ -958,6 +994,17 @@ async function rollbackService(c){
 </html>"""
 
 
+def _check_persistence() -> bool:
+    """Return True if /data looks like a bind-mounted host volume."""
+    try:
+        db_dir = os.path.dirname(DB_PATH)
+        data_dev   = os.stat(db_dir).st_dev
+        parent_dev = os.stat(os.path.dirname(db_dir.rstrip("/"))).st_dev
+        return data_dev != parent_dev
+    except Exception:
+        return True  # assume OK if we can't tell
+
+
 @app.route("/")
 def index():
     containers    = get_monitored_containers()
@@ -969,7 +1016,8 @@ def index():
     return render_template_string(HTML, containers=containers, updates_count=updates_count,
         running_count=running_count, title=WEB_TITLE, check_interval_h=interval_h,
         allow_prerelease=ALLOW_PRERELEASE, auto_update=AUTO_UPDATE,
-        ntfy_enabled=bool(NTFY_ENDPOINT), history_limit=HISTORY_LIMIT)
+        ntfy_enabled=bool(NTFY_ENDPOINT), history_limit=HISTORY_LIMIT,
+        persistent=_check_persistence())
 
 
 @app.route("/api/update", methods=["POST"])
@@ -1007,6 +1055,79 @@ def api_check():
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "containers_monitored": len(get_monitored_containers())})
+
+
+
+@app.route("/api/history/export")
+def api_history_export():
+    """Download the full version history as a JSON file — useful before migrations."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT container, tag, deployed_at, status FROM version_history ORDER BY deployed_at ASC")
+        rows = c.fetchall()
+        conn.close()
+        data = [{"container": r[0], "tag": r[1], "deployed_at": r[2], "status": r[3]} for r in rows]
+        from flask import Response
+        import json as _json
+        return Response(
+            _json.dumps({"exported_at": datetime.now().isoformat(), "history": data}, indent=2),
+            mimetype="application/json",
+            headers={"Content-Disposition": "attachment; filename=dummy-history.json"}
+        )
+    except Exception as exc:
+        log.error("api_history_export: %s", exc)
+        return jsonify({"success": False, "error": str(exc)})
+
+
+@app.route("/api/history/import", methods=["POST"])
+def api_history_import():
+    """
+    Restore version history from a previously exported JSON file.
+    Existing entries for the same container+deployed_at are skipped (safe to re-import).
+    Body: the JSON produced by /api/history/export
+    """
+    try:
+        data = request.json or {}
+        rows = data.get("history", [])
+        if not rows:
+            return jsonify({"success": False, "error": "No history entries found in payload"})
+
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        inserted = 0
+        skipped = 0
+        for row in rows:
+            try:
+                c.execute(
+                    """INSERT INTO version_history (container, tag, deployed_at, status)
+                       SELECT ?, ?, ?, ?
+                       WHERE NOT EXISTS (
+                           SELECT 1 FROM version_history
+                           WHERE container=? AND deployed_at=?
+                       )""",
+                    (row["container"], row["tag"], row["deployed_at"], row["status"],
+                     row["container"], row["deployed_at"])
+                )
+                if c.rowcount:
+                    inserted += 1
+                else:
+                    skipped += 1
+            except Exception:
+                skipped += 1
+        conn.commit()
+        conn.close()
+        log.info("History import: %d inserted, %d skipped", inserted, skipped)
+        return jsonify({"success": True, "inserted": inserted, "skipped": skipped})
+    except Exception as exc:
+        log.error("api_history_import: %s", exc)
+        return jsonify({"success": False, "error": str(exc)})
+
+
+@app.route("/api/history/<container>")
+def api_container_history(container):
+    """Return the full version history for a single container."""
+    return jsonify(get_history(container))
 
 
 if __name__ == "__main__":
