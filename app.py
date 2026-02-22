@@ -1660,10 +1660,12 @@ async function checkNow(){
     const d = await r.json();
     const jobId = d.job_id;
     if(jobId){
-      await pollJob(jobId);
+      const result = await pollJob(jobId);
+      modalDone(true, result && result.message ? result.message : 'Check complete');
     }
   } catch(e){
     appendLog('Error: ' + e.message, 'error');
+    modalDone(false, 'Check failed: ' + e.message);
   }
 
   btn.disabled = false;
@@ -1684,7 +1686,7 @@ async function doUpdate(container, tag){
     if(d.job_id){
       const result = await pollJob(d.job_id);
       if(result && result.success){
-        modalDone(true, result.message || 'Update complete');
+        modalDone(true, result.message || 'Update complete', true);
       } else {
         modalDone(false, result ? result.error : 'Unknown error');
       }
@@ -1708,7 +1710,7 @@ async function rollbackTo(container, tag){
     if(d.job_id){
       const result = await pollJob(d.job_id);
       if(result && result.success){
-        modalDone(true, result.message || 'Rollback complete');
+        modalDone(true, result.message || 'Rollback complete', true);
       } else {
         modalDone(false, result ? result.error : 'Unknown error');
       }
@@ -1768,22 +1770,24 @@ function appendLog(msg, level){
   log.scrollTop = log.scrollHeight;
 }
 
-function modalDone(success, msg){
+function modalDone(success, msg, reload=false){
   document.getElementById('modal-icon').textContent = success ? '\u2705' : '\u274C';
   if(msg) appendLog(msg, success ? 'info' : 'error');
   const close = document.getElementById('modal-close');
   close.disabled = false;
-  close.textContent = success ? 'Close & Refresh' : 'Close';
-  if(success){
+  close.textContent = (success && reload) ? 'Close & Refresh' : 'Close';
+  if(success && reload){
     close.className = 'btn btn-primary';
+    close.onclick = () => closeModal(true);
+  } else {
+    close.className = 'btn btn-ghost';
+    close.onclick = () => closeModal(false);
   }
 }
 
-function closeModal(){
+function closeModal(forceReload){
   document.getElementById('overlay').classList.remove('visible');
-  // Only reload if an update actually ran (not just a check)
-  const icon = document.getElementById('modal-icon').textContent;
-  if(icon === '\u2705') location.reload();
+  if(forceReload) location.reload();
 }
 
 // Close modal on overlay click
