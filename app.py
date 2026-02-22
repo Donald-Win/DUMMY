@@ -318,6 +318,8 @@ def init_db():
         container TEXT, tag TEXT, deployed_at TEXT, status TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS available_updates (
         container TEXT PRIMARY KEY, available_tag TEXT, checked_at TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY, value TEXT)""")
     conn.commit()
     conn.close()
 
@@ -371,6 +373,63 @@ def clear_available_update(container: str):
         conn.close()
     except Exception as exc:
         log.error("clear_available_update: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Settings (runtime config overrides stored in SQLite)
+# ---------------------------------------------------------------------------
+
+_SETTING_DEFAULTS = {
+    "check_interval":  None,   # falls back to CHECK_INTERVAL env var
+    "allow_prerelease": None,  # falls back to ALLOW_PRERELEASE env var
+    "auto_update":     None,   # falls back to AUTO_UPDATE env var
+    "history_limit":   None,   # falls back to HISTORY_LIMIT env var
+}
+
+
+def get_setting(key: str):
+    """Return the DB-stored setting value, or None if not set."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT value FROM settings WHERE key=?", (key,))
+        row = c.fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def save_setting(key: str, value: str):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as exc:
+        log.error("save_setting %s: %s", key, exc)
+        return False
+
+
+def get_all_settings() -> dict:
+    """Return all current effective settings (DB override or env default)."""
+    def _bool(key, env_default):
+        v = get_setting(key)
+        if v is None: return env_default
+        return v == "true"
+
+    def _int(key, env_default):
+        v = get_setting(key)
+        return int(v) if v else env_default
+
+    return {
+        "check_interval":   _int("check_interval", CHECK_INTERVAL),
+        "allow_prerelease": _bool("allow_prerelease", ALLOW_PRERELEASE),
+        "auto_update":      _bool("auto_update", AUTO_UPDATE),
+        "history_limit":    _int("history_limit", HISTORY_LIMIT),
+    }
 
 
 def get_available_update(container: str):
@@ -845,6 +904,7 @@ def _check_once(job_id: str = None):
     def jl(msg, level="info"):
         _jlog(job_id, msg, level)
 
+    cfg = get_all_settings()
     try:
         containers  = get_monitored_containers()
         updates_found = []
@@ -862,7 +922,7 @@ def _check_once(job_id: str = None):
                 jl(f"  → Update available: {latest}")
                 save_available_update(container, latest)
                 updates_found.append((container, current_tag, latest))
-                if AUTO_UPDATE:
+                if cfg["auto_update"]:
                     jl(f"  → AUTO_UPDATE: applying {latest}...")
                     result = update_service(container, latest, job_id=job_id)
                     if not result["success"]:
@@ -872,7 +932,7 @@ def _check_once(job_id: str = None):
 
         _last_check_time = time.time()
 
-        if updates_found and not AUTO_UPDATE:
+        if updates_found and not cfg["auto_update"]:
             lines = "\n".join(f"- {n}: {c} → {l}" for n, c, l in updates_found)
             notify(f"{len(updates_found)} update(s) available", f"Updates ready:\n{lines}")
             jl(f"Found {len(updates_found)} update(s). Notifications sent.")
@@ -889,8 +949,9 @@ def check_for_updates():
     while True:
         log.info("Running update check...")
         _check_once()
-        _next_check_time = time.time() + CHECK_INTERVAL
-        time.sleep(CHECK_INTERVAL)
+        interval = get_all_settings()["check_interval"]
+        _next_check_time = time.time() + interval
+        time.sleep(interval)
 
 
 # ---------------------------------------------------------------------------
@@ -1033,25 +1094,24 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
 .card.has-update{border-left:3px solid #f59e0b}
 .card.stopped-card{opacity:.7}
 
-/* card header — always visible, click to expand */
-.card-header{display:flex;justify-content:space-between;align-items:center;
-             padding:14px 18px;cursor:pointer;user-select:none;flex-wrap:wrap;gap:8px}
-.card-header:hover{background:var(--surface-2)}
-.card-left{display:flex;align-items:center;gap:10px}
-.chevron{color:var(--text-lo);font-size:.8em;transition:transform .25s;flex-shrink:0}
-.card.open .chevron{transform:rotate(90deg)}
-.cname{font-size:1.1em;font-weight:700;color:var(--text-hi)}
-.badges{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
-.badge{padding:4px 10px;border-radius:20px;font-size:.72em;font-weight:700;
-       text-transform:uppercase;letter-spacing:.04em}
+/* card header — always visible, no collapse */
+.card-header{display:flex;justify-content:space-between;align-items:flex-start;
+             padding:14px 18px;flex-wrap:nowrap;gap:12px}
+.card-left{flex:1;min-width:0}
+.cname{font-size:1.1em;font-weight:700;color:var(--text-hi);
+       word-break:break-word;padding-top:1px}
+
+/* badges stack vertically on the right, never wrap below the name */
+.badges{display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex-shrink:0}
+.badge{padding:3px 9px;border-radius:20px;font-size:.72em;font-weight:700;
+       text-transform:uppercase;letter-spacing:.04em;white-space:nowrap}
 .b-running {background:rgba(52,211,153,.15);color:#34d399;border:1px solid rgba(52,211,153,.3)}
 .b-stopped {background:rgba(248,113,113,.15);color:#f87171;border:1px solid rgba(248,113,113,.3)}
 .b-update  {background:rgba(245,158,11,.15);color:#f59e0b;border:1px solid rgba(245,158,11,.3)}
 .b-strategy{background:rgba(99,102,241,.1);color:#a5b4fc;border:1px solid rgba(99,102,241,.2);font-size:.68em}
 
-/* card body — hidden when collapsed */
-.card-body{max-height:0;overflow:hidden;transition:max-height .3s ease}
-.card.open .card-body{max-height:2000px}
+/* card body — always visible */
+.card-body{display:block}
 .card-inner{padding:0 18px 18px}
 
 /* info grid */
@@ -1123,10 +1183,41 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
                text-align:left;font-size:.85em;color:var(--val-text);
                margin:12px 0;overflow-x:auto}
 
+/* ── Theme button — fixed so it never jumps ──────────────────────────────── */
+#btn-theme{position:fixed;top:14px;right:14px;z-index:500;
+           padding:6px 14px;font-size:.82em;
+           box-shadow:0 2px 10px var(--shadow)}
+
+/* ── Settings modal ──────────────────────────────────────────────────────── */
+.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;padding:18px 20px}
+.setting-row{display:flex;flex-direction:column;gap:6px}
+.setting-lbl{font-size:.82em;font-weight:700;color:var(--text-md);text-transform:uppercase;letter-spacing:.05em}
+.setting-desc{font-size:.76em;color:var(--text-lo);margin-top:-2px}
+.setting-val select,.setting-val input[type=number]{
+  background:var(--val-bg);border:1px solid var(--val-border);
+  color:var(--text-hi);padding:7px 10px;border-radius:8px;font-size:.88em;width:100%;
+  outline:none;transition:border-color .2s}
+.setting-val select:focus,.setting-val input[type=number]:focus{border-color:var(--accent)}
+.toggle-wrap{display:flex;align-items:center;gap:10px;margin-top:4px}
+.toggle{position:relative;width:42px;height:24px;flex-shrink:0}
+.toggle input{opacity:0;width:0;height:0}
+.toggle-slider{position:absolute;inset:0;background:rgba(100,116,139,.3);
+               border-radius:24px;cursor:pointer;transition:background .2s}
+.toggle-slider:before{content:"";position:absolute;height:18px;width:18px;
+                       left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.2s}
+.toggle input:checked + .toggle-slider{background:#6366f1}
+.toggle input:checked + .toggle-slider:before{transform:translateX(18px)}
+.toggle-label{font-size:.88em;color:var(--text-md)}
+.settings-footer{padding:14px 20px;border-top:1px solid var(--border);
+                 display:flex;justify-content:space-between;align-items:center;gap:8px}
+.settings-saved{font-size:.85em;color:#34d399;opacity:0;transition:opacity .4s}
+.settings-saved.show{opacity:1}
+
 /* ── Responsive ──────────────────────────────────────────────────────────── */
 @media(max-width:680px){
   .stat-grid{grid-template-columns:repeat(2,1fr)}
   .dash-info-row{grid-template-columns:1fr}
+  .settings-grid{grid-template-columns:1fr}
 }
 @media(max-width:420px){
   .stat-grid{grid-template-columns:repeat(2,1fr)}
@@ -1146,8 +1237,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
         <p>Docker Update Made Manageable, Yay!</p>
       </div>
       <div class="dash-controls">
-        <button class="btn btn-ghost" id="btn-theme" onclick="toggleTheme()">&#9788; Light</button>
+        <button class="btn btn-ghost" onclick="openSettings()">&#9881; Settings</button>
       </div>
+      <!-- theme button rendered fixed via CSS, outside flow -->
+      <button class="btn btn-ghost" id="btn-theme" onclick="toggleTheme()">&#9788; Light</button>
     </div>
 
     <!-- Stat cards -->
@@ -1235,10 +1328,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
     <div class="card {% if u.has_update %}has-update{% endif %} {% if u.status != 'running' %}stopped-card{% endif %}"
          id="card-{{ u.container }}">
 
-      <!-- Always-visible header -->
-      <div class="card-header" onclick="toggleCard('{{ u.container }}')">
+      <!-- Header -->
+      <div class="card-header">
         <div class="card-left">
-          <span class="chevron">&#9654;</span>
           <span class="cname">{{ u.container }}</span>
         </div>
         <div class="badges">
@@ -1252,7 +1344,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
         </div>
       </div>
 
-      <!-- Collapsible body -->
       <div class="card-body">
         <div class="card-inner">
 
@@ -1336,6 +1427,77 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
 
 </div>
 
+<!-- ── Settings modal ──────────────────────────────────────────────────────── -->
+<div class="overlay" id="settings-overlay">
+  <div class="modal" style="max-width:520px">
+    <div class="modal-head">
+      <span class="modal-icon">&#9881;</span>
+      <span class="modal-title-text">Settings</span>
+    </div>
+    <div class="settings-grid">
+
+      <div class="setting-row">
+        <span class="setting-lbl">Check Interval</span>
+        <span class="setting-desc">How often to poll for updates</span>
+        <div class="setting-val">
+          <select id="cfg-interval">
+            <option value="3600">Every 1 hour</option>
+            <option value="7200">Every 2 hours</option>
+            <option value="21600" selected>Every 6 hours</option>
+            <option value="43200">Every 12 hours</option>
+            <option value="86400">Every 24 hours</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="setting-row">
+        <span class="setting-lbl">History Limit</span>
+        <span class="setting-desc">Versions to keep per container</span>
+        <div class="setting-val">
+          <select id="cfg-history">
+            <option value="3">3 versions</option>
+            <option value="5" selected>5 versions</option>
+            <option value="10">10 versions</option>
+            <option value="20">20 versions</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="setting-row">
+        <span class="setting-lbl">Pre-releases</span>
+        <span class="setting-desc">Include alpha/beta/RC tags</span>
+        <div class="toggle-wrap">
+          <label class="toggle">
+            <input type="checkbox" id="cfg-prerelease">
+            <span class="toggle-slider"></span>
+          </label>
+          <span class="toggle-label" id="cfg-prerelease-lbl">Off</span>
+        </div>
+      </div>
+
+      <div class="setting-row">
+        <span class="setting-lbl">Auto-update</span>
+        <span class="setting-desc">Apply updates without confirmation</span>
+        <div class="toggle-wrap">
+          <label class="toggle">
+            <input type="checkbox" id="cfg-autoupdate">
+            <span class="toggle-slider"></span>
+          </label>
+          <span class="toggle-label" id="cfg-autoupdate-lbl">Off</span>
+        </div>
+      </div>
+
+    </div>
+    <div class="settings-footer">
+      <span class="settings-saved" id="settings-saved">&#10003; Saved</span>
+      <div style="display:flex;gap:8px">
+        <button class="btn btn-ghost" onclick="closeSettings()">Cancel</button>
+        <button class="btn btn-primary" onclick="saveSettings()">Save Changes</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- ── Progress modal ──────────────────────────────────────────────────────── -->
 <div class="overlay" id="overlay">
   <div class="modal">
@@ -1411,16 +1573,78 @@ function ago(ts){
   return 'Just now';
 }
 
-// ── Card collapsing ─────────────────────────────────────────────────────────
-function toggleCard(name){
-  const card = document.getElementById('card-' + name);
-  if(card) card.classList.toggle('open');
+// ── Settings ────────────────────────────────────────────────────────────────
+function openSettings(){
+  // Load current values from API then show modal
+  fetch('/api/settings').then(r=>r.json()).then(cfg => {
+    const sel = document.getElementById('cfg-interval');
+    if(sel){
+      // Select closest matching option
+      const opts = [...sel.options].map(o=>parseInt(o.value));
+      const ci = cfg.check_interval;
+      sel.value = opts.reduce((a,b) => Math.abs(b-ci) < Math.abs(a-ci) ? b : a);
+    }
+    const sh = document.getElementById('cfg-history');
+    if(sh) sh.value = cfg.history_limit;
+    setToggle('cfg-prerelease', 'cfg-prerelease-lbl', cfg.allow_prerelease);
+    setToggle('cfg-autoupdate', 'cfg-autoupdate-lbl', cfg.auto_update);
+    document.getElementById('settings-saved').classList.remove('show');
+    document.getElementById('settings-overlay').classList.add('visible');
+  }).catch(()=>{
+    document.getElementById('settings-overlay').classList.add('visible');
+  });
 }
 
-function initCards(){
-  // Auto-expand cards that have updates
-  document.querySelectorAll('.card.has-update').forEach(c => c.classList.add('open'));
+function closeSettings(){
+  document.getElementById('settings-overlay').classList.remove('visible');
 }
+
+function setToggle(id, lblId, val){
+  const cb = document.getElementById(id);
+  const lbl = document.getElementById(lblId);
+  if(cb) cb.checked = !!val;
+  if(lbl) lbl.textContent = val ? 'On' : 'Off';
+}
+
+// Update label text when toggle is clicked
+['cfg-prerelease','cfg-autoupdate'].forEach(id => {
+  document.addEventListener('DOMContentLoaded', () => {
+    const cb = document.getElementById(id);
+    if(cb) cb.addEventListener('change', () => {
+      const lbl = document.getElementById(id+'-lbl');
+      if(lbl) lbl.textContent = cb.checked ? 'On' : 'Off';
+    });
+  });
+});
+
+async function saveSettings(){
+  const payload = {
+    check_interval:   parseInt(document.getElementById('cfg-interval').value),
+    history_limit:    parseInt(document.getElementById('cfg-history').value),
+    allow_prerelease: document.getElementById('cfg-prerelease').checked,
+    auto_update:      document.getElementById('cfg-autoupdate').checked,
+  };
+  try {
+    const r = await fetch('/api/settings', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const d = await r.json();
+    if(d.success){
+      const saved = document.getElementById('settings-saved');
+      saved.classList.add('show');
+      setTimeout(() => { saved.classList.remove('show'); }, 2500);
+      // Reload after short delay so dashboard reflects new settings
+      setTimeout(() => { closeSettings(); location.reload(); }, 1200);
+    }
+  } catch(e){ alert('Save failed: ' + e.message); }
+}
+
+// Close settings on overlay click
+document.getElementById('settings-overlay').addEventListener('click', function(e){
+  if(e.target === this) closeSettings();
+});
 
 // ── Check Now ───────────────────────────────────────────────────────────────
 async function checkNow(){
@@ -1577,7 +1801,6 @@ function escHtml(s){
 
 // ── Init ─────────────────────────────────────────────────────────────────────
 initTheme();
-initCards();
 initStatus();
 </script>
 </body>
@@ -1593,31 +1816,74 @@ def index():
     containers    = get_monitored_containers()
     updates_count = sum(1 for c in containers if c["has_update"])
     running_count = sum(1 for c in containers if c["status"] == "running")
-    interval_h    = f"{CHECK_INTERVAL // 3600}h" if CHECK_INTERVAL >= 3600 else f"{CHECK_INTERVAL // 60}m"
+    cfg = get_all_settings()
+    ci  = cfg["check_interval"]
+    interval_h = f"{ci // 3600}h" if ci >= 3600 else f"{ci // 60}m"
     for c in containers:
         c.pop("_strategy_cfg", None)
     return render_template_string(
         HTML,
-        containers    = containers,
-        updates_count = updates_count,
-        running_count = running_count,
-        title         = WEB_TITLE,
+        containers       = containers,
+        updates_count    = updates_count,
+        running_count    = running_count,
+        title            = WEB_TITLE,
         check_interval_h = interval_h,
-        allow_prerelease = ALLOW_PRERELEASE,
-        auto_update      = AUTO_UPDATE,
+        allow_prerelease = cfg["allow_prerelease"],
+        auto_update      = cfg["auto_update"],
         ntfy_enabled     = bool(NTFY_ENDPOINT),
-        history_limit    = HISTORY_LIMIT,
+        history_limit    = cfg["history_limit"],
         persistent       = _check_persistence(),
     )
 
 
 @app.route("/api/status")
 def api_status():
+    cfg = get_all_settings()
     return jsonify({
-        "last_check_time":  _last_check_time,
-        "next_check_time":  _next_check_time,
-        "check_interval":   CHECK_INTERVAL,
+        "last_check_time": _last_check_time,
+        "next_check_time": _next_check_time,
+        "check_interval":  cfg["check_interval"],
     })
+
+
+@app.route("/api/settings", methods=["GET"])
+def api_settings_get():
+    return jsonify(get_all_settings())
+
+
+@app.route("/api/settings", methods=["POST"])
+def api_settings_post():
+    data = request.json or {}
+    allowed = {"check_interval", "allow_prerelease", "auto_update", "history_limit"}
+    saved = {}
+    errors = {}
+    for key, value in data.items():
+        if key not in allowed:
+            errors[key] = "Unknown setting"
+            continue
+        try:
+            if key == "check_interval":
+                v = int(value)
+                if v < 60 or v > 86400:
+                    errors[key] = "Must be between 60 and 86400 seconds"
+                    continue
+                save_setting(key, str(v))
+                saved[key] = v
+            elif key == "history_limit":
+                v = int(value)
+                if v < 1 or v > 50:
+                    errors[key] = "Must be between 1 and 50"
+                    continue
+                save_setting(key, str(v))
+                saved[key] = v
+            elif key in ("allow_prerelease", "auto_update"):
+                v = "true" if str(value).lower() in ("true", "1", "yes") else "false"
+                save_setting(key, v)
+                saved[key] = v == "true"
+        except Exception as exc:
+            errors[key] = str(exc)
+    log.info("Settings updated: %s", saved)
+    return jsonify({"success": True, "saved": saved, "errors": errors})
 
 
 @app.route("/api/jobs/<job_id>")
