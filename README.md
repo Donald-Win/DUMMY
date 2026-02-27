@@ -1,29 +1,32 @@
-# 🐳 DUMMY – Docker Update Made Manageable, Yay!
+# 🐳 DUMMY
+### Docker Update Made Manageable, Yay!
 
-A lightweight, self-hosted web UI for monitoring Docker container versions, checking for updates, and applying or rolling back changes — with live progress feedback and persistent version history.
+DUMMY is a self-hosted web UI that monitors your Docker containers, alerts you when new versions are available, and lets you update or roll back with one click — all with live progress feedback.
 
-![Docker Hub](https://img.shields.io/docker/v/donaldwin/dummy?label=Docker%20Hub&logo=docker)
-![Multi-arch](https://img.shields.io/badge/arch-amd64%20%7C%20arm64%20%7C%20armv7-blue)
-![License](https://img.shields.io/badge/license-MIT-green)
-
----
-
-## Features
-
-- **Dashboard overview** — stat cards, configuration status, live countdown to next check
-- **Three update strategies** — auto-detected from labels, no manual mapping required
-- **Live progress modal** — real-time log output for every update, rollback, and check
-- **Health-check gating** — automatic rollback if a container fails to become healthy
-- **Full version history** — roll back to any previous version, not just the last one
-- **History export / import** — download a JSON backup before migrations, restore after
-- **In-UI settings** — adjust check interval, history limit, pre-releases, and auto-update without editing compose files
-- **Dark / light mode** — persisted per browser
-- **ntfy notifications** — updates available, success, and failure alerts
-- **Persistence check** — warns on startup and in the UI if `/data` is not bind-mounted
+[![Docker Hub](https://img.shields.io/docker/v/donaldwin/dummy?label=Docker%20Hub&logo=docker&logoColor=white)](https://hub.docker.com/r/donaldwin/dummy)
+[![Multi-arch](https://img.shields.io/badge/arch-amd64%20%7C%20arm64%20%7C%20armv7-blue)](#)
+[![License](https://img.shields.io/badge/license-MIT-green)](#)
 
 ---
 
-## Quick start
+![DUMMY screenshot showing dashboard with stat cards and container list](.github/screenshot.png)
+
+---
+
+## What it does
+
+- Polls Docker Hub and GHCR for newer image versions on a schedule
+- Shows a live dashboard — how many containers are monitored, running, and up to date
+- Lets you apply updates and watch the pull / recreate / health-check happen in real time
+- Rolls back automatically if a container fails its health check after an update
+- Keeps a per-container version history so you can restore any previous version at any time
+- Sends push notifications via ntfy when updates are found or applied
+
+---
+
+## Quick setup
+
+### 1. Add DUMMY to your stack
 
 ```yaml
 services:
@@ -34,39 +37,17 @@ services:
     ports:
       - "5000:5000"
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /path/to/data/dummy:/data          # required for persistent history
-      # - /path/to/.env:/env/.env          # add if using Mode 3 (env file)
+      - /var/run/docker.sock:/var/run/docker.sock   # required — Docker access
+      - /opt/stacks/dummy:/data                      # required — persistent history
     environment:
-      - TZ=Pacific/Auckland
-      - NTFY_ENDPOINT=http://ntfy:80       # optional
-      - NTFY_TOPIC=DockerUpdate
+      TZ: Pacific/Auckland
+    networks:
+      - your_network
 ```
 
-Open `http://your-server:5000`. Then add `dummy.enable=true` to any container you want monitored.
+### 2. Opt containers in with a single label
 
----
-
-## Setup is one label
-
-The minimum to monitor any container:
-
-```yaml
-labels:
-  - dummy.enable=true
-```
-
-DUMMY detects the image, polls the registry, and shows updates in the UI. No env files, no compose edits, no `VERSION_VARS` to configure.
-
----
-
-## Three update strategies
-
-DUMMY automatically selects a strategy based on which labels are present. You can mix strategies across containers.
-
-### Mode 1 — Docker API (default)
-
-DUMMY pulls the new image and recreates the container via the Docker SDK, preserving all config — volumes, ports, networks, env vars, restart policy, capabilities, and network aliases.
+Add `dummy.enable=true` to any service you want monitored:
 
 ```yaml
 services:
@@ -76,22 +57,46 @@ services:
       - dummy.enable=true
 ```
 
-> ⚠️ Running `docker compose up` manually after an API-mode update will revert the tag to whatever is in your compose file. Use Mode 2 or 3 if you need files kept in sync.
+That's it. DUMMY will detect the image, poll the registry, and show available updates in the UI.
+
+### 3. Open the UI
+
+Navigate to `http://your-server:5000`
 
 ---
 
-### Mode 2 — Compose file editing
+## Three update strategies
 
-DUMMY edits the image tag directly in your `docker-compose.yml` and runs `docker compose up -d <service>`. Your compose file always reflects the running version.
+DUMMY picks a strategy automatically based on which labels you add. You can use a different strategy per container.
+
+### Strategy 1 — Docker API (default)
+
+No extra labels needed beyond `dummy.enable=true`. DUMMY recreates the container via the Docker SDK, preserving all volumes, ports, networks, environment variables, and restart policies.
+
+```yaml
+services:
+  radarr:
+    image: lscr.io/linuxserver/radarr:6.0.4.10291
+    labels:
+      - dummy.enable=true
+```
+
+> ⚠️ If you later run `docker compose up` manually, Compose will revert the tag to whatever is pinned in your compose file. Use Strategy 2 or 3 if you want the file kept in sync.
+
+---
+
+### Strategy 2 — Compose file
+
+DUMMY edits the image tag in your `docker-compose.yml` and runs `docker compose up -d <service>`. Your file always reflects what's actually running.
 
 ```yaml
 services:
   sonarr:
-    image: lscr.io/linuxserver/sonarr:${SONARR_VER}
+    image: lscr.io/linuxserver/sonarr:4.0.16.2944
     labels:
       - dummy.enable=true
       - dummy.compose_file=/compose/docker-compose.yml
-      # - dummy.compose_service=sonarr   # optional if name differs from container
+      # - dummy.compose_service=sonarr   # only needed if the service name differs from container name
 ```
 
 Add to DUMMY's volumes:
@@ -101,9 +106,9 @@ Add to DUMMY's volumes:
 
 ---
 
-### Mode 3 — Env file editing
+### Strategy 3 — Env file
 
-DUMMY updates a version variable in your `.env` file and restarts the container. Ideal when you pin versions as variables and reference them in compose like `image: radarr:${RADARR_VER}`.
+DUMMY updates a version variable in your `.env` file and restarts the container. Best when you manage versions as variables and reference them like `image: radarr:${RADARR_VER}`.
 
 ```yaml
 services:
@@ -121,9 +126,9 @@ Add to DUMMY's volumes:
 
 ---
 
-### Combining modes
+### Combining strategies
 
-Modes 2 and 3 work together — DUMMY updates both files in one operation:
+Strategies 2 and 3 can be combined to keep both your compose file and `.env` in sync:
 
 ```yaml
 labels:
@@ -134,207 +139,13 @@ labels:
 
 ---
 
-## All supported labels
+## Full example compose.yml
 
-| Label | Example value | Description |
-|---|---|---|
-| `dummy.enable` | `true` | **Required.** Opt this container in to monitoring. |
-| `dummy.compose_file` | `/compose/docker-compose.yml` | Path inside the DUMMY container to the compose file to edit. Enables Mode 2. |
-| `dummy.compose_service` | `sonarr` | Service name in the compose file. Defaults to the container name. |
-| `dummy.env_var` | `SONARR_VER` | Variable name in the `.env` file to update. Enables Mode 3. |
-| `dummy.changelog` | `https://github.com/.../releases` | Override the changelog link shown in the UI. Many registries are auto-detected. |
-
----
-
-## In-UI settings
-
-Click the **⚙ Settings** button to adjust these without touching your compose file:
-
-| Setting | Default | Description |
-|---|---|---|
-| Check interval | 6 hours | How often DUMMY polls registries for updates. Options: 1h / 2h / 6h / 12h / 24h. |
-| History limit | 5 versions | How many past versions to store per container. |
-| Pre-releases | Off | Include alpha / beta / rc / nightly / edge tags when checking for newer versions. |
-| Auto-update | Off | Apply updates automatically without UI confirmation. |
-
-Settings are persisted in the SQLite database and survive container restarts. They take precedence over environment variables, so you can set a sensible default via env and override it from the UI at any time.
-
----
-
-## Environment variables
-
-Settings that cannot be changed from the UI at runtime:
-
-### Paths and ports
-
-| Variable | Default | Description |
-|---|---|---|
-| `ENV_FILE_PATH` | `/env/.env` | Path inside the container to your `.env` file (Mode 3). |
-| `DB_PATH` | `/data/versions.db` | SQLite database path. Mount `/data` to a host directory to persist. |
-| `PORT` | `5000` | Port Flask listens on inside the container. |
-
-### Notifications (ntfy)
-
-| Variable | Default | Description |
-|---|---|---|
-| `NTFY_ENDPOINT` | _(disabled)_ | Base URL of your ntfy server, e.g. `http://ntfy:80`. Leave unset to disable. |
-| `NTFY_TOPIC` | `DockerUpdate` | ntfy topic name. |
-| `NTFY_TOKEN` | _(none)_ | Bearer token for authenticated ntfy instances. |
-| `NTFY_CLICK_URL` | _(none)_ | URL embedded in the notification to open the DUMMY UI. |
-
-### GitHub API
-
-| Variable | Default | Description |
-|---|---|---|
-| `GITHUB_TOKEN` | _(none)_ | Personal access token. Raises GHCR rate limit from 60 to 5000 req/hour. No scopes needed for public images. |
-
-### Update behaviour (overrideable in UI)
-
-These set the initial defaults. The UI settings panel takes precedence once saved.
-
-| Variable | Default | Description |
-|---|---|---|
-| `CHECK_INTERVAL` | `21600` | Seconds between background update checks. |
-| `ALLOW_PRERELEASE` | `false` | Include pre-release tags. |
-| `AUTO_UPDATE` | `false` | Apply updates automatically. |
-| `HEALTH_CHECK_TIMEOUT` | `60` | Seconds to wait for a container to become healthy before rolling back. |
-| `HISTORY_LIMIT` | `5` | Past versions to store per container. |
-
-### Misc
-
-| Variable | Default | Description |
-|---|---|---|
-| `CHANGELOG_URLS` | _(none)_ | Pipe-separated `image-fragment=url` pairs to override auto-detected changelog links, e.g. `myapp=https://github.com/me/myapp/releases\|other=https://other.io`. |
-| `WEB_TITLE` | `DUMMY` | Page title shown in the browser tab and header. |
-| `TZ` | _(system)_ | Container timezone, e.g. `Pacific/Auckland`. |
-| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
-
-### Backward compatibility
-
-| Variable | Example | Description |
-|---|---|---|
-| `VERSION_VARS` | `radarr=RADARR_VER,sonarr=SONARR_VER` | Legacy: comma-separated `container=ENV_VAR` pairs. Equivalent to `dummy.enable=true` + `dummy.env_var=X` on each service, without modifying the service definitions. |
-
----
-
-## Volumes
-
-| Mount | Required | Description |
-|---|---|---|
-| `/var/run/docker.sock` | Always | Docker socket for container inspection and management. |
-| `/data` | **Strongly recommended** | Persistent SQLite database. Without this, version history and rollback data is lost on every container restart. DUMMY will show a warning in the UI if this is not a proper bind mount. |
-| `/compose/docker-compose.yml` | Mode 2 only | The compose file DUMMY will read and edit. |
-| `/env/.env` | Mode 3 only | The `.env` file DUMMY will read and edit. |
-
----
-
-## Health-check gating
-
-Every update and rollback waits for the container to become healthy before marking it as complete. If the container fails to reach a healthy state within `HEALTH_CHECK_TIMEOUT` seconds, DUMMY:
-
-1. Automatically reverts to the previous version
-2. Restarts the container on the old version
-3. Sends a failure notification via ntfy (if configured)
-
-The previous image is always retained locally so rollbacks are instant — no re-pull needed.
-
----
-
-## Version history and rollback
-
-DUMMY stores the last N versions per container (configurable). In the UI each container shows its history with a **↩ Restore** button on every past entry. You can roll back to any recorded version, not just the most recent.
-
-### Exporting and importing history
-
-Before migrating your stack or rebuilding your Pi, export a backup:
-
-```bash
-curl http://your-server:5000/api/history/export -o dummy-history.json
-```
-
-Or use the **↓ Export History** button in the UI. To restore after:
-
-```bash
-curl -X POST http://your-server:5000/api/history/import \
-  -H "Content-Type: application/json" \
-  -d @dummy-history.json
-```
-
-Re-importing is safe — duplicate entries are skipped.
-
----
-
-## Registry support
-
-DUMMY auto-detects the registry from the image name:
-
-| Image prefix | Registry queried |
-|---|---|
-| `ghcr.io/<org>/<repo>` | GitHub Container Registry |
-| `lscr.io/linuxserver/<repo>` | Docker Hub `linuxserver/<repo>` |
-| `<org>/<repo>` or `docker.io/<org>/<repo>` | Docker Hub |
-| Plain `<repo>` | Docker Hub official library |
-
----
-
-## Auto-detected changelogs
-
-DUMMY automatically links the changelog for common images. The following are recognised without any configuration:
-
-`linuxserver/*` · `immich-app/immich` · `gethomepage/homepage` · `FlareSolverr/FlareSolverr` · `advplyr/audiobookshelf` · `AdguardTeam/AdGuardHome` · `binwiederhier/ntfy` · `Plex Media Server` · `qBittorrent` · `jellyfin/jellyfin` · `portainer/portainer`
-
-Override or add extras using the `CHANGELOG_URLS` environment variable or the `dummy.changelog` label.
-
----
-
-## API reference
-
-| Method | Path | Body / Notes |
-|---|---|---|
-| `GET` | `/` | Web UI |
-| `GET` | `/health` | `{"status":"ok","containers_monitored":N}` |
-| `GET` | `/api/status` | Last check time, next check time, current interval |
-| `GET` | `/api/containers` | JSON array of all monitored containers with current state |
-| `POST` | `/api/check` | Trigger an immediate background update scan. Returns `{"job_id":"..."}` |
-| `POST` | `/api/update` | `{"container":"name","tag":"1.2.3"}` — apply an update. Returns `{"job_id":"..."}` |
-| `POST` | `/api/rollback` | `{"container":"name"}` (previous) or `{"container":"name","tag":"1.0.0"}` (specific). Returns `{"job_id":"..."}` |
-| `GET` | `/api/jobs/<id>` | Poll a running job for live log output and completion status |
-| `GET` | `/api/settings` | Current effective settings (DB overrides or env defaults) |
-| `POST` | `/api/settings` | `{"check_interval":3600,"allow_prerelease":false,...}` — update settings |
-| `GET` | `/api/history/export` | Download full version history as `dummy-history.json` |
-| `POST` | `/api/history/import` | Restore history from a previously exported JSON file |
-| `GET` | `/api/history/<container>` | Version history for a single container |
-
----
-# 🐳 DUMMY – Docker Update Made Manageable, Yay!
-
-A lightweight, self-hosted web UI for monitoring Docker container versions, checking for updates, and applying or rolling back changes — with live progress feedback and persistent version history.
-
-![Docker Hub](https://img.shields.io/docker/v/donaldwin/dummy?label=Docker%20Hub&logo=docker)
-![Multi-arch](https://img.shields.io/badge/arch-amd64%20%7C%20arm64%20%7C%20armv7-blue)
-![License](https://img.shields.io/badge/license-MIT-green)
-
----
-
-## Features
-
-- **Dashboard overview** — stat cards, configuration status, live countdown to next check
-- **Three update strategies** — auto-detected from labels, no manual mapping required
-- **Live progress modal** — real-time log output for every update, rollback, and check
-- **Health-check gating** — automatic rollback if a container fails to become healthy
-- **Full version history** — roll back to any previous version, not just the last one
-- **History export / import** — download a JSON backup before migrations, restore after
-- **In-UI settings** — adjust check interval, history limit, pre-releases, and auto-update without editing compose files
-- **Dark / light mode** — persisted per browser
-- **ntfy notifications** — updates available, success, and failure alerts
-- **Persistence check** — warns on startup and in the UI if `/data` is not bind-mounted
-
----
-
-## Quick start
+A realistic multi-service setup using all three strategies:
 
 ```yaml
 services:
+
   dummy:
     image: donaldwin/dummy:latest
     container_name: dummy
@@ -343,279 +154,215 @@ services:
       - "5000:5000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - /path/to/data/dummy:/data          # required for persistent history
-      # - /path/to/.env:/env/.env          # add if using Mode 3 (env file)
+      - /opt/stacks/dummy:/data
+      - /opt/stacks/.env:/env/.env                         # needed for Strategy 3
+      - /opt/stacks/docker-compose.yml:/compose/docker-compose.yml  # needed for Strategy 2
     environment:
-      - TZ=Pacific/Auckland
-      - NTFY_ENDPOINT=http://ntfy:80       # optional
-      - NTFY_TOPIC=DockerUpdate
-```
+      TZ: Pacific/Auckland
+      NTFY_ENDPOINT: http://ntfy:80                        # optional push notifications
+      NTFY_TOPIC: DockerUpdate
+      NTFY_CLICK_URL: http://update.yourdomain.com
+    networks:
+      - internal
 
-Open `http://your-server:5000`. Then add `dummy.enable=true` to any container you want monitored.
-
----
-
-## Setup is one label
-
-The minimum to monitor any container:
-
-```yaml
-labels:
-  - dummy.enable=true
-```
-
-DUMMY detects the image, polls the registry, and shows updates in the UI. No env files, no compose edits, no `VERSION_VARS` to configure.
-
----
-
-## Three update strategies
-
-DUMMY automatically selects a strategy based on which labels are present. You can mix strategies across containers.
-
-### Mode 1 — Docker API (default)
-
-DUMMY pulls the new image and recreates the container via the Docker SDK, preserving all config — volumes, ports, networks, env vars, restart policy, capabilities, and network aliases.
-
-```yaml
-services:
-  radarr:
-    image: lscr.io/linuxserver/radarr:6.0.4.10291
+  # Strategy 1 — Docker API (simplest, no extra labels)
+  adguardhome:
+    image: adguard/adguardhome:v0.107.72
+    container_name: adguardhome
+    restart: unless-stopped
     labels:
       - dummy.enable=true
-```
+    networks:
+      - internal
 
-> ⚠️ Running `docker compose up` manually after an API-mode update will revert the tag to whatever is in your compose file. Use Mode 2 or 3 if you need files kept in sync.
+  # Strategy 3 — Env file (version pinned in .env as RADARR_VER=6.0.4.10291)
+  radarr:
+    image: lscr.io/linuxserver/radarr:${RADARR_VER}
+    container_name: radarr
+    restart: unless-stopped
+    labels:
+      - dummy.enable=true
+      - dummy.env_var=RADARR_VER
+    networks:
+      - internal
 
----
-
-### Mode 2 — Compose file editing
-
-DUMMY edits the image tag directly in your `docker-compose.yml` and runs `docker compose up -d <service>`. Your compose file always reflects the running version.
-
-```yaml
-services:
-  sonarr:
-    image: lscr.io/linuxserver/sonarr:${SONARR_VER}
+  # Strategy 2 — Compose file (DUMMY edits this file directly)
+  homepage:
+    image: ghcr.io/gethomepage/homepage:V1.10.1
+    container_name: homepage
+    restart: unless-stopped
     labels:
       - dummy.enable=true
       - dummy.compose_file=/compose/docker-compose.yml
-      # - dummy.compose_service=sonarr   # optional if name differs from container
-```
+    networks:
+      - internal
 
-Add to DUMMY's volumes:
-```yaml
-- /path/to/your/docker-compose.yml:/compose/docker-compose.yml
-```
-
----
-
-### Mode 3 — Env file editing
-
-DUMMY updates a version variable in your `.env` file and restarts the container. Ideal when you pin versions as variables and reference them in compose like `image: radarr:${RADARR_VER}`.
-
-```yaml
-services:
-  prowlarr:
-    image: lscr.io/linuxserver/prowlarr:${PROWLARR_VER}
-    labels:
-      - dummy.enable=true
-      - dummy.env_var=PROWLARR_VER
-```
-
-Add to DUMMY's volumes:
-```yaml
-- /path/to/your/.env:/env/.env
+networks:
+  internal:
+    external: true
 ```
 
 ---
 
-### Combining modes
+## All labels
 
-Modes 2 and 3 work together — DUMMY updates both files in one operation:
-
-```yaml
-labels:
-  - dummy.enable=true
-  - dummy.compose_file=/compose/docker-compose.yml
-  - dummy.env_var=PROWLARR_VER
-```
-
----
-
-## All supported labels
-
-| Label | Example value | Description |
+| Label | Example | Description |
 |---|---|---|
 | `dummy.enable` | `true` | **Required.** Opt this container in to monitoring. |
-| `dummy.compose_file` | `/compose/docker-compose.yml` | Path inside the DUMMY container to the compose file to edit. Enables Mode 2. |
-| `dummy.compose_service` | `sonarr` | Service name in the compose file. Defaults to the container name. |
-| `dummy.env_var` | `SONARR_VER` | Variable name in the `.env` file to update. Enables Mode 3. |
-| `dummy.changelog` | `https://github.com/.../releases` | Override the changelog link shown in the UI. Many registries are auto-detected. |
+| `dummy.compose_file` | `/compose/docker-compose.yml` | Path to the compose file inside the DUMMY container. Enables Strategy 2. |
+| `dummy.compose_service` | `sonarr` | Service name in the compose file if it differs from the container name. |
+| `dummy.env_var` | `RADARR_VER` | Variable name in the `.env` file to update. Enables Strategy 3. |
+| `dummy.changelog` | `https://github.com/.../releases` | Override the changelog URL shown in the UI. |
 
 ---
 
-## In-UI settings
+## Settings
 
-Click the **⚙ Settings** button to adjust these without touching your compose file:
+Click **⚙ Settings** in the UI to configure these without editing any files:
 
 | Setting | Default | Description |
 |---|---|---|
-| Check interval | 6 hours | How often DUMMY polls registries for updates. Options: 1h / 2h / 6h / 12h / 24h. |
-| History limit | 5 versions | How many past versions to store per container. |
-| Pre-releases | Off | Include alpha / beta / rc / nightly / edge tags when checking for newer versions. |
-| Auto-update | Off | Apply updates automatically without UI confirmation. |
+| Check interval | Every 6h | How often DUMMY polls registries. Options: 1h / 2h / 6h / 12h / 24h. |
+| History limit | 5 versions | Past versions to store per container for rollback. |
+| Pre-releases | Off | Include alpha / beta / rc / nightly tags. |
+| Auto-update | Off | Apply updates automatically without confirmation. |
 
-Settings are persisted in the SQLite database and survive container restarts. They take precedence over environment variables, so you can set a sensible default via env and override it from the UI at any time.
+Settings are saved to the database and persist across restarts. They override environment variables, so you can set defaults via env and tune them from the UI without redeploying.
 
 ---
 
 ## Environment variables
 
-Settings that cannot be changed from the UI at runtime:
-
-### Paths and ports
+### Required paths
 
 | Variable | Default | Description |
 |---|---|---|
-| `ENV_FILE_PATH` | `/env/.env` | Path inside the container to your `.env` file (Mode 3). |
-| `DB_PATH` | `/data/versions.db` | SQLite database path. Mount `/data` to a host directory to persist. |
-| `PORT` | `5000` | Port Flask listens on inside the container. |
+| `DB_PATH` | `/data/versions.db` | SQLite database. Always mount `/data` to a host directory. |
+| `ENV_FILE_PATH` | `/env/.env` | Your `.env` file inside the container (Strategy 3). |
+| `PORT` | `5000` | Port Flask listens on. |
 
 ### Notifications (ntfy)
 
-| Variable | Default | Description |
-|---|---|---|
-| `NTFY_ENDPOINT` | _(disabled)_ | Base URL of your ntfy server, e.g. `http://ntfy:80`. Leave unset to disable. |
-| `NTFY_TOPIC` | `DockerUpdate` | ntfy topic name. |
-| `NTFY_TOKEN` | _(none)_ | Bearer token for authenticated ntfy instances. |
-| `NTFY_CLICK_URL` | _(none)_ | URL embedded in the notification to open the DUMMY UI. |
+| Variable | Description |
+|---|---|
+| `NTFY_ENDPOINT` | Base URL of your ntfy server, e.g. `http://ntfy:80`. Leave unset to disable. |
+| `NTFY_TOPIC` | Topic name. Default: `DockerUpdate`. |
+| `NTFY_TOKEN` | Bearer token for authenticated ntfy instances. |
+| `NTFY_CLICK_URL` | URL opened when tapping the notification. |
 
-### GitHub API
-
-| Variable | Default | Description |
-|---|---|---|
-| `GITHUB_TOKEN` | _(none)_ | Personal access token. Raises GHCR rate limit from 60 to 5000 req/hour. No scopes needed for public images. |
-
-### Update behaviour (overrideable in UI)
-
-These set the initial defaults. The UI settings panel takes precedence once saved.
+### Advanced
 
 | Variable | Default | Description |
 |---|---|---|
-| `CHECK_INTERVAL` | `21600` | Seconds between background update checks. |
-| `ALLOW_PRERELEASE` | `false` | Include pre-release tags. |
-| `AUTO_UPDATE` | `false` | Apply updates automatically. |
-| `HEALTH_CHECK_TIMEOUT` | `60` | Seconds to wait for a container to become healthy before rolling back. |
-| `HISTORY_LIMIT` | `5` | Past versions to store per container. |
-
-### Misc
-
-| Variable | Default | Description |
-|---|---|---|
-| `CHANGELOG_URLS` | _(none)_ | Pipe-separated `image-fragment=url` pairs to override auto-detected changelog links, e.g. `myapp=https://github.com/me/myapp/releases\|other=https://other.io`. |
-| `WEB_TITLE` | `DUMMY` | Page title shown in the browser tab and header. |
-| `TZ` | _(system)_ | Container timezone, e.g. `Pacific/Auckland`. |
+| `GITHUB_TOKEN` | — | Personal access token. Raises GHCR rate limit from 60 → 5000 req/hour. No scopes needed for public images. |
+| `HEALTH_CHECK_TIMEOUT` | `60` | Seconds to wait for a healthy container before rolling back. |
+| `CHANGELOG_URLS` | — | Pipe-separated `image-fragment=url` pairs to add or override changelog links. Example: `myapp=https://github.com/me/myapp/releases` |
+| `WEB_TITLE` | `DUMMY` | Page title shown in the browser tab. |
+| `TZ` | system | Container timezone, e.g. `Pacific/Auckland`. |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
 
-### Backward compatibility
+### Initial defaults (overrideable in the UI)
 
-| Variable | Example | Description |
+| Variable | Default | Description |
 |---|---|---|
-| `VERSION_VARS` | `radarr=RADARR_VER,sonarr=SONARR_VER` | Legacy: comma-separated `container=ENV_VAR` pairs. Equivalent to `dummy.enable=true` + `dummy.env_var=X` on each service, without modifying the service definitions. |
+| `CHECK_INTERVAL` | `21600` | Seconds between checks (21600 = 6h). |
+| `ALLOW_PRERELEASE` | `false` | Include pre-release tags. |
+| `AUTO_UPDATE` | `false` | Apply updates automatically. |
+| `HISTORY_LIMIT` | `5` | Versions stored per container. |
 
 ---
 
 ## Volumes
 
-| Mount | Required | Description |
+| Mount | When needed | Description |
 |---|---|---|
-| `/var/run/docker.sock` | Always | Docker socket for container inspection and management. |
-| `/data` | **Strongly recommended** | Persistent SQLite database. Without this, version history and rollback data is lost on every container restart. DUMMY will show a warning in the UI if this is not a proper bind mount. |
-| `/compose/docker-compose.yml` | Mode 2 only | The compose file DUMMY will read and edit. |
-| `/env/.env` | Mode 3 only | The `.env` file DUMMY will read and edit. |
+| `/var/run/docker.sock` | Always | Docker socket. Required for all container inspection and management. |
+| `/data` | Always | **Bind-mount this to a host path.** Stores version history, update cache, and settings. Data is lost on restart without this. |
+| `/env/.env` | Strategy 3 | The `.env` file DUMMY will read and edit. |
+| `/compose/docker-compose.yml` | Strategy 2 | The compose file DUMMY will read and edit. |
 
 ---
 
-## Health-check gating
+## How updates work
 
-Every update and rollback waits for the container to become healthy before marking it as complete. If the container fails to reach a healthy state within `HEALTH_CHECK_TIMEOUT` seconds, DUMMY:
+When you click **Update** (or DUMMY applies one automatically):
 
-1. Automatically reverts to the previous version
-2. Restarts the container on the old version
-3. Sends a failure notification via ntfy (if configured)
-
-The previous image is always retained locally so rollbacks are instant — no re-pull needed.
+1. Pulls the new image
+2. Stops and removes the old container
+3. Recreates it with identical config — same volumes, ports, networks, env vars, restart policy, and capabilities
+4. Waits up to `HEALTH_CHECK_TIMEOUT` seconds for the container to become healthy
+5. If the health check fails → automatically reverts to the previous image, restarts, and sends a failure notification
+6. If it passes → records the new version in history and sends a success notification
 
 ---
 
 ## Version history and rollback
 
-DUMMY stores the last N versions per container (configurable). In the UI each container shows its history with a **↩ Restore** button on every past entry. You can roll back to any recorded version, not just the most recent.
+Every container card shows its version history. Click **↩ Restore** next to any past entry to roll back to that exact version. The rollback goes through the same pull → recreate → health-check flow as a forward update.
 
 ### Exporting and importing history
 
-Before migrating your stack or rebuilding your Pi, export a backup:
+Before migrating your host or rebuilding your server:
 
 ```bash
+# Export
 curl http://your-server:5000/api/history/export -o dummy-history.json
-```
 
-Or use the **↓ Export History** button in the UI. To restore after:
-
-```bash
+# Import after migration
 curl -X POST http://your-server:5000/api/history/import \
   -H "Content-Type: application/json" \
   -d @dummy-history.json
 ```
 
-Re-importing is safe — duplicate entries are skipped.
+Re-importing is safe — duplicates are skipped automatically.
 
 ---
 
-## Registry support
+## Supported registries
 
-DUMMY auto-detects the registry from the image name:
-
-| Image prefix | Registry queried |
+| Image format | Source |
 |---|---|
 | `ghcr.io/<org>/<repo>` | GitHub Container Registry |
-| `lscr.io/linuxserver/<repo>` | Docker Hub `linuxserver/<repo>` |
-| `<org>/<repo>` or `docker.io/<org>/<repo>` | Docker Hub |
-| Plain `<repo>` | Docker Hub official library |
+| `lscr.io/linuxserver/<repo>` | Docker Hub (LinuxServer) |
+| `<org>/<repo>` | Docker Hub |
+| `<repo>` | Docker Hub official library |
+
+GHCR images are queried via the GitHub Packages API first, with an automatic fallback to the Docker Registry v2 API for public images that don't require a token.
 
 ---
 
 ## Auto-detected changelogs
 
-DUMMY automatically links the changelog for common images. The following are recognised without any configuration:
+Changelog links are shown automatically for:
 
 `linuxserver/*` · `immich-app/immich` · `gethomepage/homepage` · `FlareSolverr/FlareSolverr` · `advplyr/audiobookshelf` · `AdguardTeam/AdGuardHome` · `binwiederhier/ntfy` · `Plex Media Server` · `qBittorrent` · `jellyfin/jellyfin` · `portainer/portainer`
 
-Override or add extras using the `CHANGELOG_URLS` environment variable or the `dummy.changelog` label.
+Add your own via the `CHANGELOG_URLS` environment variable or `dummy.changelog` label.
 
 ---
 
-## API reference
+## API
 
-| Method | Path | Body / Notes |
+All update, rollback, and check operations return a `job_id` immediately and run in the background. Poll `/api/jobs/<id>` to stream log lines and check completion.
+
+| Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/` | Web UI |
-| `GET` | `/health` | `{"status":"ok","containers_monitored":N}` |
-| `GET` | `/api/status` | Last check time, next check time, current interval |
-| `GET` | `/api/containers` | JSON array of all monitored containers with current state |
-| `POST` | `/api/check` | Trigger an immediate background update scan. Returns `{"job_id":"..."}` |
-| `POST` | `/api/update` | `{"container":"name","tag":"1.2.3"}` — apply an update. Returns `{"job_id":"..."}` |
-| `POST` | `/api/rollback` | `{"container":"name"}` (previous) or `{"container":"name","tag":"1.0.0"}` (specific). Returns `{"job_id":"..."}` |
-| `GET` | `/api/jobs/<id>` | Poll a running job for live log output and completion status |
-| `GET` | `/api/settings` | Current effective settings (DB overrides or env defaults) |
-| `POST` | `/api/settings` | `{"check_interval":3600,"allow_prerelease":false,...}` — update settings |
-| `GET` | `/api/history/export` | Download full version history as `dummy-history.json` |
-| `POST` | `/api/history/import` | Restore history from a previously exported JSON file |
-| `GET` | `/api/history/<container>` | Version history for a single container |
+| `GET` | `/health` | Health check |
+| `GET` | `/api/status` | Last/next check times and current interval |
+| `GET` | `/api/containers` | All monitored containers and their current state |
+| `POST` | `/api/check` | Trigger an immediate update scan |
+| `POST` | `/api/update` | `{"container":"name","tag":"1.2.3"}` |
+| `POST` | `/api/rollback` | `{"container":"name"}` or `{"container":"name","tag":"1.0.0"}` |
+| `GET` | `/api/jobs/<id>` | Poll a running job for live log output |
+| `GET` | `/api/settings` | Current settings |
+| `POST` | `/api/settings` | Update settings |
+| `GET` | `/api/history/export` | Download full history as JSON |
+| `POST` | `/api/history/import` | Restore history from JSON |
+| `GET` | `/api/history/<container>` | History for one container |
 
 ---
 
 ## License
 
 MIT
-
