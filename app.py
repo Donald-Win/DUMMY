@@ -209,30 +209,92 @@ def query_dockerhub(org: str, repo: str, current_tag: str):
         return None
 
 
+def _find_newest_tag(tags: list, current_tag: str):
+    """Return the highest stable tag newer than current_tag, or None."""
+    newest = None
+    for tag in tags:
+        if not tag or tag.startswith("sha") or not is_stable_tag(tag):
+            continue
+        if is_newer(current_tag, tag):
+            if newest is None or is_newer(newest, tag):
+                newest = tag
+    return newest
+
+
+def _query_ghcr_registry_api(org: str, repo: str, current_tag: str):
+    """
+    Fallback: query the Docker Registry v2 API directly on ghcr.io.
+    This works for public images without a GitHub token, using only an
+    anonymous bearer token issued by the registry itself.
+    """
+    image_path = f"{org}/{repo}"
+    try:
+        # Step 1: get an anonymous pull token from the ghcr.io auth service
+        tok_resp = req.get(
+            f"https://ghcr.io/token?scope=repository:{image_path}:pull",
+            timeout=10,
+        )
+        if tok_resp.status_code != 200:
+            log.warning("GHCR registry token %s HTTP %s", image_path, tok_resp.status_code)
+            return None
+        token = tok_resp.json().get("token")
+        if not token:
+            return None
+
+        # Step 2: list tags via the v2 registry API
+        tags_resp = req.get(
+            f"https://ghcr.io/v2/{image_path}/tags/list",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        if tags_resp.status_code != 200:
+            log.warning("GHCR registry tags %s HTTP %s", image_path, tags_resp.status_code)
+            return None
+
+        tags = tags_resp.json().get("tags") or []
+        result = _find_newest_tag(tags, current_tag)
+        if result:
+            log.info("GHCR registry API found %s for %s (current: %s)", result, image_path, current_tag)
+        return result
+    except Exception as exc:
+        log.error("_query_ghcr_registry_api %s/%s: %s", org, repo, exc)
+        return None
+
+
 def query_ghcr(org: str, repo: str, current_tag: str):
-    url = f"https://api.github.com/orgs/{org}/packages/container/{repo}/versions?per_page=30"
+    """
+    Try the GitHub Packages API first (requires token for some packages).
+    Fall back to the Docker Registry v2 API on ghcr.io, which works
+    anonymously for all public images.
+    """
+    # ── Attempt 1: GitHub Packages API (org endpoint) ──────────────────────
+    url = f"https://api.github.com/orgs/{org}/packages/container/{repo}/versions?per_page=100"
     try:
         resp = req.get(url, headers=_ghcr_headers(), timeout=10)
         if resp.status_code in (401, 404):
-            # org endpoint failed — try user endpoint (e.g. FlareSolverr, advplyr)
-            url = f"https://api.github.com/users/{org}/packages/container/{repo}/versions?per_page=30"
+            # Try user endpoint (personal accounts like FlareSolverr, advplyr)
+            url = f"https://api.github.com/users/{org}/packages/container/{repo}/versions?per_page=100"
             resp = req.get(url, headers=_ghcr_headers(), timeout=10)
-        if resp.status_code != 200:
-            log.warning("GHCR %s/%s HTTP %s", org, repo, resp.status_code)
-            return None
-        newest = None
-        for version in resp.json():
-            tags = version.get("metadata", {}).get("container", {}).get("tags", [])
-            for tag in tags:
-                if tag.startswith("sha") or not is_stable_tag(tag):
-                    continue
-                if is_newer(current_tag, tag):
-                    if newest is None or is_newer(newest, tag):
-                        newest = tag
-        return newest
+
+        if resp.status_code == 200:
+            all_tags = []
+            for version in resp.json():
+                all_tags.extend(
+                    version.get("metadata", {}).get("container", {}).get("tags", [])
+                )
+            result = _find_newest_tag(all_tags, current_tag)
+            if result is not None:
+                return result
+            # Got 200 but found nothing newer — could be auth hiding versions
+            log.debug("GHCR packages API returned 200 for %s/%s but no newer tag found", org, repo)
+        else:
+            log.warning("GHCR packages API %s/%s HTTP %s — falling back to registry API",
+                        org, repo, resp.status_code)
     except Exception as exc:
-        log.error("query_ghcr %s/%s: %s", org, repo, exc)
-        return None
+        log.warning("GHCR packages API %s/%s error: %s — falling back to registry API", org, repo, exc)
+
+    # ── Attempt 2: Docker Registry v2 API (always works for public images) ─
+    return _query_ghcr_registry_api(org, repo, current_tag)
 
 
 def get_latest_tag(image: str, current_tag: str):
