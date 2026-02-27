@@ -213,7 +213,8 @@ def query_ghcr(org: str, repo: str, current_tag: str):
     url = f"https://api.github.com/orgs/{org}/packages/container/{repo}/versions?per_page=30"
     try:
         resp = req.get(url, headers=_ghcr_headers(), timeout=10)
-        if resp.status_code == 401:
+        if resp.status_code in (401, 404):
+            # org endpoint failed — try user endpoint (e.g. FlareSolverr, advplyr)
             url = f"https://api.github.com/users/{org}/packages/container/{repo}/versions?per_page=30"
             resp = req.get(url, headers=_ghcr_headers(), timeout=10)
         if resp.status_code != 200:
@@ -263,7 +264,7 @@ def get_latest_tag(image: str, current_tag: str):
 # Changelog
 # ---------------------------------------------------------------------------
 _KNOWN_CHANGELOGS = {
-    "lscr.io/linuxserver":  "https://github.com/linuxserver/{repo}/releases",
+    "lscr.io/linuxserver":  "https://github.com/linuxserver/docker-{repo}/releases",
     "ghcr.io/immich-app":   "https://github.com/immich-app/immich/releases",
     "ghcr.io/gethomepage":  "https://github.com/gethomepage/homepage/releases",
     "ghcr.io/flaresolverr": "https://github.com/FlareSolverr/FlareSolverr/releases",
