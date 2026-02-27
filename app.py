@@ -144,16 +144,27 @@ def _job_done(job_id: str, success: bool, message: str = "", error: str = ""):
 _DEV_KEYWORDS = [
     "alpha", "beta", "rc", "nightly", "edge", "dev", "test",
     "snapshot", "experimental", "-b.", ".b.",
+    # CI/CD build tags — never real releases
+    "pr-", "-pr.", "feature-", "feat-", "fix-", "hotfix-",
+    "staging", "canary", "preview", "prerelease", "pre-release",
+    "refs-", "sha-", "build-", "ci-", "main-", "master-",
 ]
 _ARCH_KEYWORDS = [
     "arm64v8", "amd64", "armhf", "arm32v7", "i386", "ppc64le",
     "s390x", "linux-", "-arm64", "-armv7", "-armv6", "-aarch64",
 ]
 
+# Tags must look like a version to be considered.
+# Accepts: 1.2.3  v1.2.3  V1.2.3  version-1.2.3  1.2.3-4  1.43.0.10492-abc07
+# Rejects: pr-1633  feature-xyz  latest  main
+_VERSION_RE = re.compile(r"^(?:version-|[vV])?(\d+)([.\-]\d+)*([.\-][a-zA-Z0-9]+)?$")
+
 
 def is_stable_tag(tag: str) -> bool:
     if ALLOW_PRERELEASE:
-        return True
+        # Even with pre-releases on, reject obvious CI noise
+        tl = tag.lower()
+        return not any(kw in tl for kw in ("pr-", "feature-", "feat-", "sha-", "build-", "refs-"))
     tl = tag.lower()
     if any(kw in tl for kw in _DEV_KEYWORDS):
         return False
@@ -162,6 +173,9 @@ def is_stable_tag(tag: str) -> bool:
     if re.search(r"-ls\d+", tl):
         return False
     if re.search(r"-lt\d+-", tl):
+        return False
+    # Must look like a version number — rejects 'latest', 'main', 'pr-1633', etc.
+    if not _VERSION_RE.match(tag):
         return False
     return True
 
