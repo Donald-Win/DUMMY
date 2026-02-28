@@ -9,10 +9,6 @@ DUMMY is a self-hosted web UI that monitors your Docker containers, alerts you w
 
 ---
 
-![DUMMY screenshot showing dashboard with stat cards and container list](.github/screenshot.png)
-
----
-
 ## What it does
 
 - Polls Docker Hub and GHCR for newer image versions on a schedule
