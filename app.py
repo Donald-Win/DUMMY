@@ -515,8 +515,20 @@ def get_available_update(container: str):
         c = conn.cursor()
         c.execute("SELECT available_tag FROM available_updates WHERE container=?", (container,))
         row = c.fetchone()
+        if not row:
+            conn.close()
+            return None
+        tag = row[0]
+        # Validate cached tag against current filter — clears stale bad tags
+        # (e.g. pr-*, feature-* cached before the filter was tightened)
+        if not is_stable_tag(tag):
+            log.info("Clearing invalid cached tag %r for %s", tag, container)
+            c.execute("DELETE FROM available_updates WHERE container=?", (container,))
+            conn.commit()
+            conn.close()
+            return None
         conn.close()
-        return row[0] if row else None
+        return tag
     except Exception:
         return None
 
