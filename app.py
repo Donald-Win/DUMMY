@@ -96,6 +96,11 @@ _jobs_lock = threading.Lock()
 _last_check_time: float = 0.0
 _next_check_time: float = 0.0
 
+# Active operation guard — prevents two simultaneous updates on the same container
+_active_containers: set = set()
+_active_lock = threading.Lock()
+_check_running = threading.Event()   # set while a check is in progress
+
 
 def _new_job() -> str:
     job_id = str(uuid.uuid4())[:8]
@@ -118,7 +123,8 @@ def _new_job() -> str:
 
 
 def _jlog(job_id: str, msg: str, level: str = "info"):
-    log.info("[job:%s] %s", job_id, msg)
+    _log_fn = {"error": log.error, "warn": log.warning, "warning": log.warning}.get(level, log.info)
+    _log_fn("[job:%s] %s", job_id, msg)
     if job_id:
         with _jobs_lock:
             if job_id in _jobs:
@@ -205,19 +211,22 @@ def _ghcr_headers() -> dict:
 
 
 def query_dockerhub(org: str, repo: str, current_tag: str):
-    url = f"https://hub.docker.com/v2/repositories/{org}/{repo}/tags?page_size=50"
+    # Fetch up to 5 pages of 100 tags each (500 total) following the
+    # Docker Hub "next" pagination URL. Most repos need only 1 page.
+    url = f"https://hub.docker.com/v2/repositories/{org}/{repo}/tags?page_size=100&ordering=last_updated"
+    all_tags = []
+    page = 0
     try:
-        resp = req.get(url, timeout=10)
-        if resp.status_code != 200:
-            log.warning("DockerHub %s/%s HTTP %s", org, repo, resp.status_code)
-            return None
-        tags = [t["name"] for t in resp.json().get("results", []) if is_stable_tag(t["name"])]
-        newest = None
-        for tag in tags:
-            if is_newer(current_tag, tag):
-                if newest is None or is_newer(newest, tag):
-                    newest = tag
-        return newest
+        while url and page < 5:
+            page += 1
+            resp = req.get(url, timeout=10)
+            if resp.status_code != 200:
+                log.warning("DockerHub %s/%s HTTP %s", org, repo, resp.status_code)
+                break
+            body = resp.json()
+            all_tags.extend(t["name"] for t in body.get("results", []) if is_stable_tag(t["name"]))
+            url = body.get("next")   # None when no more pages
+        return _find_newest_tag(all_tags, current_tag)
     except Exception as exc:
         log.error("query_dockerhub %s/%s: %s", org, repo, exc)
         return None
@@ -404,6 +413,8 @@ def init_db():
         log.warning("Could not verify persistence of %s: %s", db_dir, exc)
 
     conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")   # allows concurrent readers + one writer
+    conn.execute("PRAGMA synchronous=NORMAL") # safe with WAL; faster than FULL
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS version_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -418,13 +429,14 @@ def init_db():
 
 def add_to_history(container: str, tag: str, status: str = "deployed"):
     try:
+        limit = get_all_settings()["history_limit"]
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("INSERT INTO version_history (container,tag,deployed_at,status) VALUES (?,?,?,?)",
                   (container, tag, datetime.now().isoformat(), status))
         c.execute("""DELETE FROM version_history WHERE id NOT IN (
             SELECT id FROM version_history WHERE container=? ORDER BY deployed_at DESC LIMIT ?)""",
-                  (container, HISTORY_LIMIT))
+                  (container, limit))
         conn.commit()
         conn.close()
     except Exception as exc:
@@ -506,15 +518,27 @@ def save_setting(key: str, value: str):
 
 
 def get_all_settings() -> dict:
-    """Return all current effective settings (DB override or env default)."""
-    def _bool(key, env_default):
-        v = get_setting(key)
-        if v is None: return env_default
-        return v == "true"
+    """Return all current effective settings (DB override or env default).
+    Uses a single DB connection and one query for all keys.
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT key, value FROM settings WHERE key IN (?,?,?,?)",
+                  ("check_interval", "allow_prerelease", "auto_update", "history_limit"))
+        overrides = {row[0]: row[1] for row in c.fetchall()}
+        conn.close()
+    except Exception:
+        overrides = {}
 
-    def _int(key, env_default):
-        v = get_setting(key)
-        return int(v) if v else env_default
+    def _bool(key, default):
+        v = overrides.get(key)
+        return (v == "true") if v is not None else default
+
+    def _int(key, default):
+        v = overrides.get(key)
+        try: return int(v) if v is not None else default
+        except (ValueError, TypeError): return default
 
     return {
         "check_interval":   _int("check_interval", CHECK_INTERVAL),
@@ -573,8 +597,12 @@ def write_env_var(var: str, value: str) -> bool:
         for i, line in enumerate(lines):
             if line.startswith(f"{var}="):
                 lines[i] = f"{var}={value}\n"
-                with open(ENV_FILE, "w") as f:
+                # Atomic write: write to a temp file then rename so a
+                # power failure mid-write never leaves the .env corrupted
+                tmp = ENV_FILE + ".tmp"
+                with open(tmp, "w") as f:
                     f.writelines(lines)
+                os.replace(tmp, ENV_FILE)
                 return True
         log.warning("write_env_var: %s not found in %s", var, ENV_FILE)
     except Exception as exc:
@@ -597,8 +625,12 @@ def read_compose(path: str):
 
 def write_compose(path: str, data: dict) -> bool:
     try:
-        with open(path, "w") as f:
+        # Atomic write: temp file then rename so a power failure mid-write
+        # never leaves the compose file in a partially-written state
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
             yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        os.replace(tmp, path)
         return True
     except Exception as exc:
         log.error("write_compose %s: %s", path, exc)
@@ -854,9 +886,14 @@ def get_monitored_containers() -> list:
 # Update / rollback
 # ---------------------------------------------------------------------------
 
-def update_service(container: str, new_tag: str, job_id: str = None) -> dict:
+def update_service(container: str, new_tag: str, job_id: str = None, history_status: str = "deployed") -> dict:
     def jl(msg, level="info"):
         _jlog(job_id, msg, level)
+
+    with _active_lock:
+        if container in _active_containers:
+            return {"success": False, "error": f"{container} is already being updated"}
+        _active_containers.add(container)
 
     try:
         client        = dockerlib.from_env()
@@ -902,7 +939,7 @@ def update_service(container: str, new_tag: str, job_id: str = None) -> dict:
                 notify(f"Update Failed: {container}", f"Rolled back to {current_tag}", priority="4", tags="warning")
                 return {"success": False, "error": "Health check failed — auto-rolled back"}
 
-            add_to_history(container, new_tag)
+            add_to_history(container, new_tag, status=history_status)
             clear_available_update(container)
             jl(f"Done! {current_tag} → {new_tag}")
             notify(f"Updated: {container}", f"{container}: {current_tag} → {new_tag}", tags="white_check_mark")
@@ -934,7 +971,7 @@ def update_service(container: str, new_tag: str, job_id: str = None) -> dict:
                 notify(f"Update Failed: {container}", f"Rolled back to {old_tag}", priority="4", tags="warning")
                 return {"success": False, "error": "Health check failed — auto-rolled back"}
 
-            add_to_history(container, new_tag)
+            add_to_history(container, new_tag, status=history_status)
             clear_available_update(container)
             jl(f"Done! {current_tag} → {new_tag}")
             notify(f"Updated: {container}", f"{container}: {current_tag} → {new_tag}", tags="white_check_mark")
@@ -962,7 +999,7 @@ def update_service(container: str, new_tag: str, job_id: str = None) -> dict:
                 notify(f"Update Failed: {container}", f"Rolled back to {current_tag}", priority="4", tags="warning")
                 return {"success": False, "error": "Health check failed — auto-rolled back"}
 
-            add_to_history(container, new_tag)
+            add_to_history(container, new_tag, status=history_status)
             clear_available_update(container)
             jl(f"Done! {current_tag} → {new_tag}")
             notify(f"Updated: {container}", f"{container}: {current_tag} → {new_tag}", tags="white_check_mark")
@@ -971,6 +1008,9 @@ def update_service(container: str, new_tag: str, job_id: str = None) -> dict:
     except Exception as exc:
         log.error("update_service %s: %s", container, exc)
         return {"success": False, "error": str(exc)}
+    finally:
+        with _active_lock:
+            _active_containers.discard(container)
 
 
 def rollback_service(container: str, target_tag: str = None, job_id: str = None) -> dict:
@@ -989,9 +1029,8 @@ def rollback_service(container: str, target_tag: str = None, job_id: str = None)
             target_tag = candidates[1]["tag"]
 
         jl(f"Rolling back {container} to {target_tag}")
-        result = update_service(container, target_tag, job_id=job_id)
-        if result.get("success"):
-            add_to_history(container, target_tag, status="rolled_back")
+        result = update_service(container, target_tag, job_id=job_id,
+                                history_status="rolled_back")
         return result
 
     except Exception as exc:
@@ -1005,6 +1044,13 @@ def rollback_service(container: str, target_tag: str = None, job_id: str = None)
 
 def _check_once(job_id: str = None):
     global _last_check_time
+
+    # Debounce: only one check at a time
+    if _check_running.is_set():
+        _jlog(job_id, "A check is already in progress — skipping", "warn")
+        return
+    _check_running.set()
+
     def jl(msg, level="info"):
         _jlog(job_id, msg, level)
 
@@ -1046,6 +1092,8 @@ def _check_once(job_id: str = None):
     except Exception as exc:
         log.error("_check_once: %s", exc)
         jl(f"Check failed: {exc}", "error")
+    finally:
+        _check_running.clear()
 
 
 def check_for_updates():
@@ -1947,10 +1995,14 @@ def index():
 @app.route("/api/status")
 def api_status():
     cfg = get_all_settings()
+    with _active_lock:
+        active = list(_active_containers)
     return jsonify({
         "last_check_time": _last_check_time,
         "next_check_time": _next_check_time,
         "check_interval":  cfg["check_interval"],
+        "check_running":   _check_running.is_set(),
+        "active_updates":  active,
     })
 
 
@@ -2050,6 +2102,9 @@ def api_rollback():
 
 @app.route("/api/check", methods=["POST"])
 def api_check():
+    if _check_running.is_set():
+        return jsonify({"success": False, "error": "A check is already running"}), 429
+
     job_id = _new_job()
 
     def run():
