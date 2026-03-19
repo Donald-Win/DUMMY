@@ -240,6 +240,7 @@ def _query_ghcr_registry_api(org: str, repo: str, current_tag: str):
     Fallback: query the Docker Registry v2 API directly on ghcr.io.
     This works for public images without a GitHub token, using only an
     anonymous bearer token issued by the registry itself.
+    Follows Link header pagination so all tags are checked.
     """
     image_path = f"{org}/{repo}"
     try:
@@ -255,20 +256,34 @@ def _query_ghcr_registry_api(org: str, repo: str, current_tag: str):
         if not token:
             return None
 
-        # Step 2: list tags via the v2 registry API
-        tags_resp = req.get(
-            f"https://ghcr.io/v2/{image_path}/tags/list",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=10,
-        )
-        if tags_resp.status_code != 200:
-            log.warning("GHCR registry tags %s HTTP %s", image_path, tags_resp.status_code)
-            return None
+        headers = {"Authorization": f"Bearer {token}"}
+        all_tags = []
+        # Request a large page size; follow Link: rel="next" pagination if present
+        url = f"https://ghcr.io/v2/{image_path}/tags/list?n=1000"
+        page = 0
+        while url and page < 10:   # safety cap at 10 pages (~10 000 tags)
+            page += 1
+            resp = req.get(url, headers=headers, timeout=10)
+            if resp.status_code != 200:
+                log.warning("GHCR registry tags %s page %d HTTP %s",
+                            image_path, page, resp.status_code)
+                break
+            all_tags.extend(resp.json().get("tags") or [])
+            # Follow pagination via Link header: <url>; rel="next"
+            link = resp.headers.get("Link", "")
+            url = None
+            for part in link.split(","):
+                part = part.strip()
+                if 'rel="next"' in part:
+                    url = part.split(";")[0].strip().strip("<>")
+                    break
 
-        tags = tags_resp.json().get("tags") or []
-        result = _find_newest_tag(tags, current_tag)
+        log.debug("GHCR registry API fetched %d tags for %s over %d page(s)",
+                  len(all_tags), image_path, page)
+        result = _find_newest_tag(all_tags, current_tag)
         if result:
-            log.info("GHCR registry API found %s for %s (current: %s)", result, image_path, current_tag)
+            log.info("GHCR registry API found %s for %s (current: %s)",
+                     result, image_path, current_tag)
         return result
     except Exception as exc:
         log.error("_query_ghcr_registry_api %s/%s: %s", org, repo, exc)
