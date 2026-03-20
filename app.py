@@ -59,6 +59,10 @@ NTFY_CLICK_URL   = os.environ.get("NTFY_CLICK_URL", "")
 
 GITHUB_TOKEN     = os.environ.get("GITHUB_TOKEN", "")
 
+BASIC_AUTH_USER  = os.environ.get("BASIC_AUTH_USER", "")
+BASIC_AUTH_PASS  = os.environ.get("BASIC_AUTH_PASS", "")
+WEBHOOK_URL      = os.environ.get("WEBHOOK_URL", "").strip()
+
 # Backward-compat: VERSION_VARS => env_file strategy
 VERSION_MAP: dict = {}
 for pair in os.environ.get("VERSION_VARS", "").split(","):
@@ -72,6 +76,22 @@ for pair in os.environ.get("CHANGELOG_URLS", "").split("|"):
     if "=" in pair:
         k, v = pair.strip().split("=", 1)
         CHANGELOGS[k.strip()] = v.strip()
+
+# ---------------------------------------------------------------------------
+# Docker client (lazy singleton — one connection, reused across requests)
+# ---------------------------------------------------------------------------
+_docker_client = None
+_docker_lock   = threading.Lock()
+
+def get_docker_client():
+    global _docker_client
+    if _docker_client is not None:
+        return _docker_client
+    with _docker_lock:
+        if _docker_client is None:
+            _docker_client = dockerlib.from_env()
+    return _docker_client
+
 
 # ---------------------------------------------------------------------------
 # Strategy constants
@@ -203,6 +223,35 @@ def is_newer(current: str, candidate: str) -> bool:
 # Registry queries
 # ---------------------------------------------------------------------------
 
+def _req_get(url: str, headers: dict = None, timeout: int = 10,
+             max_attempts: int = 3) -> "req.Response | None":
+    """GET with exponential-backoff retry and Retry-After / rate-limit awareness."""
+    for attempt in range(max_attempts):
+        try:
+            resp = req.get(url, headers=headers or {}, timeout=timeout)
+            # Honour rate-limit backoff headers
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", 10))
+                log.warning("Rate-limited by %s — waiting %ds", url[:60], retry_after)
+                time.sleep(min(retry_after, 60))
+                continue
+            # On transient server errors, back off and retry
+            if resp.status_code >= 500 and attempt < max_attempts - 1:
+                delay = 2 ** attempt
+                log.debug("HTTP %s from %s, retrying in %ds", resp.status_code, url[:60], delay)
+                time.sleep(delay)
+                continue
+            return resp
+        except (req.exceptions.ConnectionError, req.exceptions.Timeout) as exc:
+            if attempt < max_attempts - 1:
+                delay = 2 ** attempt
+                log.debug("Request error (%s), retrying in %ds: %s", type(exc).__name__, delay, url[:60])
+                time.sleep(delay)
+            else:
+                log.error("Request failed after %d attempts: %s — %s", max_attempts, url[:60], exc)
+    return None
+
+
 def _ghcr_headers() -> dict:
     h = {"Accept": "application/vnd.github+json"}
     if GITHUB_TOKEN:
@@ -211,21 +260,26 @@ def _ghcr_headers() -> dict:
 
 
 def query_dockerhub(org: str, repo: str, current_tag: str):
-    # Fetch up to 5 pages of 100 tags each (500 total) following the
-    # Docker Hub "next" pagination URL. Most repos need only 1 page.
+    # Fetch up to 5 pages of 100 tags each (500 total) following Docker Hub
+    # "next" pagination URL. Uses _req_get for retry + rate-limit handling.
     url = f"https://hub.docker.com/v2/repositories/{org}/{repo}/tags?page_size=100&ordering=last_updated"
     all_tags = []
     page = 0
     try:
         while url and page < 5:
             page += 1
-            resp = req.get(url, timeout=10)
-            if resp.status_code != 200:
-                log.warning("DockerHub %s/%s HTTP %s", org, repo, resp.status_code)
+            resp = _req_get(url)
+            if resp is None or resp.status_code != 200:
+                log.warning("DockerHub %s/%s HTTP %s", org, repo,
+                            resp.status_code if resp else "no-response")
                 break
+            # Warn when rate limit is running low
+            remaining = resp.headers.get("X-RateLimit-Remaining")
+            if remaining and int(remaining) < 10:
+                log.warning("DockerHub rate limit low: %s requests remaining", remaining)
             body = resp.json()
             all_tags.extend(t["name"] for t in body.get("results", []) if is_stable_tag(t["name"]))
-            url = body.get("next")   # None when no more pages
+            url = body.get("next")
         return _find_newest_tag(all_tags, current_tag)
     except Exception as exc:
         log.error("query_dockerhub %s/%s: %s", org, repo, exc)
@@ -254,11 +308,8 @@ def _query_ghcr_registry_api(org: str, repo: str, current_tag: str):
     image_path = f"{org}/{repo}"
     try:
         # Step 1: get an anonymous pull token from the ghcr.io auth service
-        tok_resp = req.get(
-            f"https://ghcr.io/token?scope=repository:{image_path}:pull",
-            timeout=10,
-        )
-        if tok_resp.status_code != 200:
+        tok_resp = _req_get(f"https://ghcr.io/token?scope=repository:{image_path}:pull")
+        if tok_resp is None or tok_resp.status_code != 200:
             log.warning("GHCR registry token %s HTTP %s", image_path, tok_resp.status_code)
             return None
         token = tok_resp.json().get("token")
@@ -272,10 +323,10 @@ def _query_ghcr_registry_api(org: str, repo: str, current_tag: str):
         page = 0
         while url and page < 10:   # safety cap at 10 pages (~10 000 tags)
             page += 1
-            resp = req.get(url, headers=headers, timeout=10)
-            if resp.status_code != 200:
+            resp = _req_get(url, headers=headers)
+            if resp is None or resp.status_code != 200:
                 log.warning("GHCR registry tags %s page %d HTTP %s",
-                            image_path, page, resp.status_code)
+                            image_path, page, resp.status_code if resp else "no-response")
                 break
             all_tags.extend(resp.json().get("tags") or [])
             # Follow pagination via Link header: <url>; rel="next"
@@ -308,13 +359,13 @@ def query_ghcr(org: str, repo: str, current_tag: str):
     # ── Attempt 1: GitHub Packages API (org endpoint) ──────────────────────
     url = f"https://api.github.com/orgs/{org}/packages/container/{repo}/versions?per_page=100"
     try:
-        resp = req.get(url, headers=_ghcr_headers(), timeout=10)
-        if resp.status_code in (401, 404):
+        resp = _req_get(url, headers=_ghcr_headers())
+        if resp is not None and resp.status_code in (401, 404):
             # Try user endpoint (personal accounts like FlareSolverr, advplyr)
             url = f"https://api.github.com/users/{org}/packages/container/{repo}/versions?per_page=100"
-            resp = req.get(url, headers=_ghcr_headers(), timeout=10)
+            resp = _req_get(url, headers=_ghcr_headers())
 
-        if resp.status_code == 200:
+        if resp is not None and resp.status_code == 200:
             all_tags = []
             for version in resp.json():
                 all_tags.extend(
@@ -327,7 +378,7 @@ def query_ghcr(org: str, repo: str, current_tag: str):
             log.debug("GHCR packages API returned 200 for %s/%s but no newer tag found", org, repo)
         else:
             log.warning("GHCR packages API %s/%s HTTP %s — falling back to registry API",
-                        org, repo, resp.status_code)
+                        org, repo, resp.status_code if resp else "no-response")
     except Exception as exc:
         log.warning("GHCR packages API %s/%s error: %s — falling back to registry API", org, repo, exc)
 
@@ -395,6 +446,31 @@ def get_changelog(image: str, label_override: str = None):
 # Database
 # ---------------------------------------------------------------------------
 
+# Current schema version — increment when adding migrations below
+_SCHEMA_VERSION = 2
+
+# Each entry is (version, sql) — run in order when upgrading
+_MIGRATIONS = [
+    (1, """CREATE TABLE IF NOT EXISTS version_history (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               container TEXT, tag TEXT, deployed_at TEXT, status TEXT)"""),
+    (1, """CREATE TABLE IF NOT EXISTS available_updates (
+               container TEXT PRIMARY KEY, available_tag TEXT, checked_at TEXT)"""),
+    (1, """CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)"""),
+    (2, """CREATE TABLE IF NOT EXISTS dismissed_updates (
+               container TEXT, tag TEXT, dismissed_at TEXT,
+               PRIMARY KEY (container, tag))"""),
+]
+
+
+def _get_conn() -> sqlite3.Connection:
+    """Open a WAL-mode connection to the database."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
 def init_db():
     db_dir = os.path.dirname(DB_PATH)
     os.makedirs(db_dir, exist_ok=True)
@@ -412,25 +488,26 @@ def init_db():
     except Exception as exc:
         log.warning("Could not verify persistence of %s: %s", db_dir, exc)
 
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA journal_mode=WAL")   # allows concurrent readers + one writer
-    conn.execute("PRAGMA synchronous=NORMAL") # safe with WAL; faster than FULL
+    conn = _get_conn()
     c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS version_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        container TEXT, tag TEXT, deployed_at TEXT, status TEXT)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS available_updates (
-        container TEXT PRIMARY KEY, available_tag TEXT, checked_at TEXT)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY, value TEXT)""")
+    # Bootstrap schema_version table
+    c.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)")
+    c.execute("SELECT COALESCE(MAX(version), 0) FROM schema_version")
+    current = c.fetchone()[0]
+    for version, sql in _MIGRATIONS:
+        if version > current:
+            log.info("DB migration: applying schema v%d", version)
+            c.executescript(sql)
+            c.execute("INSERT OR REPLACE INTO schema_version VALUES (?)", (version,))
     conn.commit()
     conn.close()
+    log.info("DB schema up to date (v%d)", _SCHEMA_VERSION)
 
 
 def add_to_history(container: str, tag: str, status: str = "deployed"):
     try:
         limit = get_all_settings()["history_limit"]
-        conn = sqlite3.connect(DB_PATH)
+        conn = _get_conn()
         c = conn.cursor()
         c.execute("INSERT INTO version_history (container,tag,deployed_at,status) VALUES (?,?,?,?)",
                   (container, tag, datetime.now().isoformat(), status))
@@ -445,7 +522,7 @@ def add_to_history(container: str, tag: str, status: str = "deployed"):
 
 def get_history(container: str) -> list:
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = _get_conn()
         c = conn.cursor()
         c.execute("SELECT tag,deployed_at,status FROM version_history WHERE container=? ORDER BY deployed_at DESC LIMIT ?",
                   (container, HISTORY_LIMIT))
@@ -458,7 +535,7 @@ def get_history(container: str) -> list:
 
 def save_available_update(container: str, tag: str):
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = _get_conn()
         c = conn.cursor()
         c.execute("INSERT OR REPLACE INTO available_updates VALUES (?,?,?)",
                   (container, tag, datetime.now().isoformat()))
@@ -470,13 +547,92 @@ def save_available_update(container: str, tag: str):
 
 def clear_available_update(container: str):
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = _get_conn()
         c = conn.cursor()
         c.execute("DELETE FROM available_updates WHERE container=?", (container,))
         conn.commit()
         conn.close()
     except Exception as exc:
         log.error("clear_available_update: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Dismissed updates
+# ---------------------------------------------------------------------------
+
+def is_dismissed(container: str, tag: str) -> bool:
+    """Return True if the user has dismissed this specific update."""
+    try:
+        conn = _get_conn()
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM dismissed_updates WHERE container=? AND tag=?", (container, tag))
+        found = c.fetchone() is not None
+        conn.close()
+        return found
+    except Exception:
+        return False
+
+
+def dismiss_update(container: str, tag: str):
+    """Dismiss an available update so it no longer shows as actionable."""
+    try:
+        conn = _get_conn()
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO dismissed_updates VALUES (?,?,?)",
+                  (container, tag, datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+        log.info("Dismissed update %s → %s", container, tag)
+    except Exception as exc:
+        log.error("dismiss_update: %s", exc)
+
+
+def undismiss_update(container: str, tag: str = None):
+    """Re-enable a dismissed update (or all for a container if tag is None)."""
+    try:
+        conn = _get_conn()
+        c = conn.cursor()
+        if tag:
+            c.execute("DELETE FROM dismissed_updates WHERE container=? AND tag=?", (container, tag))
+        else:
+            c.execute("DELETE FROM dismissed_updates WHERE container=?", (container,))
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        log.error("undismiss_update: %s", exc)
+
+
+def get_dismissed(container: str) -> list:
+    """Return all dismissed tags for a container."""
+    try:
+        conn = _get_conn()
+        c = conn.cursor()
+        c.execute("SELECT tag, dismissed_at FROM dismissed_updates WHERE container=? ORDER BY dismissed_at DESC",
+                  (container,))
+        rows = c.fetchall()
+        conn.close()
+        return [{"tag": r[0], "dismissed_at": r[1]} for r in rows]
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Webhook
+# ---------------------------------------------------------------------------
+
+def send_webhook(event: str, data: dict):
+    """POST a JSON event payload to WEBHOOK_URL if configured."""
+    if not WEBHOOK_URL:
+        return
+    payload = {"event": event, "timestamp": datetime.now().isoformat(), **data}
+    try:
+        resp = req.post(WEBHOOK_URL, json=payload, timeout=10)
+        if resp.status_code >= 400:
+            log.warning("Webhook %s returned HTTP %s", event, resp.status_code)
+        else:
+            log.debug("Webhook %s sent OK", event)
+    except Exception as exc:
+        log.warning("Webhook failed (%s): %s", event, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -494,7 +650,7 @@ _SETTING_DEFAULTS = {
 def get_setting(key: str):
     """Return the DB-stored setting value, or None if not set."""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = _get_conn()
         c = conn.cursor()
         c.execute("SELECT value FROM settings WHERE key=?", (key,))
         row = c.fetchone()
@@ -506,7 +662,7 @@ def get_setting(key: str):
 
 def save_setting(key: str, value: str):
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = _get_conn()
         c = conn.cursor()
         c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value))
         conn.commit()
@@ -522,7 +678,7 @@ def get_all_settings() -> dict:
     Uses a single DB connection and one query for all keys.
     """
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = _get_conn()
         c = conn.cursor()
         c.execute("SELECT key, value FROM settings WHERE key IN (?,?,?,?)",
                   ("check_interval", "allow_prerelease", "auto_update", "history_limit"))
@@ -550,7 +706,7 @@ def get_all_settings() -> dict:
 
 def get_available_update(container: str):
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = _get_conn()
         c = conn.cursor()
         c.execute("SELECT available_tag FROM available_updates WHERE container=?", (container,))
         row = c.fetchone()
@@ -774,7 +930,7 @@ def check_container_health(container_name: str, timeout: int = None, jlog=None) 
     if jlog:
         jlog(f"Health check — waiting up to {timeout}s...")
     try:
-        client    = dockerlib.from_env()
+        client    = get_docker_client()
         container = client.containers.get(container_name)
         deadline  = time.time() + timeout
         while time.time() < deadline:
@@ -835,10 +991,23 @@ def _resolve_strategy(container_name: str, dummy_labels: dict) -> dict:
     return {"strategy": STRATEGY_DOCKER_API}
 
 
+def get_container_checked_at(container: str) -> str:
+    """Return the checked_at timestamp for a container, or empty string."""
+    try:
+        conn = _get_conn()
+        c = conn.cursor()
+        c.execute("SELECT checked_at FROM available_updates WHERE container=?", (container,))
+        row = c.fetchone()
+        conn.close()
+        return row[0] if row else ""
+    except Exception:
+        return ""
+
+
 def get_monitored_containers() -> list:
     items = []
     try:
-        client   = dockerlib.from_env()
+        client   = get_docker_client()
         env_vars = read_env()
 
         for c in client.containers.list():
@@ -851,6 +1020,7 @@ def get_monitored_containers() -> list:
             image, tag   = get_image_parts(c)
             strategy_cfg = _resolve_strategy(c.name, dummy_labels)
             strategy     = strategy_cfg["strategy"]
+            pinned       = dummy_labels.get("pin", "").lower() == "true"
 
             if strategy == STRATEGY_ENV_FILE:
                 current_tag = env_vars.get(strategy_cfg["env_var"], tag)
@@ -859,20 +1029,33 @@ def get_monitored_containers() -> list:
             else:
                 current_tag = tag
 
-            available_tag = get_available_update(c.name)
+            available_tag = get_available_update(c.name) if not pinned else None
             history       = get_history(c.name)
+            dismissed     = get_dismissed(c.name)
+            checked_at    = get_container_checked_at(c.name)
+
+            # An update is actionable only if it exists, differs, and is not dismissed
+            has_update = bool(
+                available_tag
+                and available_tag != current_tag
+                and not pinned
+                and not is_dismissed(c.name, available_tag)
+            )
 
             items.append({
                 "container":      c.name,
                 "image":          image,
                 "current_tag":    current_tag,
-                "available_tag":  available_tag,
-                "has_update":     bool(available_tag and available_tag != current_tag),
+                "available_tag":  available_tag if not is_dismissed(c.name, available_tag or "") else None,
+                "has_update":     has_update,
+                "pinned":         pinned,
                 "status":         c.status,
                 "strategy":       strategy,
                 "strategy_label": STRATEGY_LABELS[strategy],
                 "changelog":      get_changelog(image, dummy_labels.get("changelog")),
                 "history":        history,
+                "dismissed":      dismissed,
+                "checked_at":     checked_at,
                 "_strategy_cfg":  strategy_cfg,
             })
 
@@ -896,7 +1079,7 @@ def update_service(container: str, new_tag: str, job_id: str = None, history_sta
         _active_containers.add(container)
 
     try:
-        client        = dockerlib.from_env()
+        client        = get_docker_client()
         container_obj = client.containers.get(container)
         image, _      = get_image_parts(container_obj)
         dummy_labels  = _get_dummy_labels(container_obj)
@@ -937,12 +1120,14 @@ def update_service(container: str, new_tag: str, job_id: str = None, history_sta
                 container_obj.restart()
                 check_container_health(container, timeout=30)
                 notify(f"Update Failed: {container}", f"Rolled back to {current_tag}", priority="4", tags="warning")
+                send_webhook("update_failed", {"container": container, "attempted_tag": new_tag, "rolled_back_to": current_tag})
                 return {"success": False, "error": "Health check failed — auto-rolled back"}
 
             add_to_history(container, new_tag, status=history_status)
             clear_available_update(container)
             jl(f"Done! {current_tag} → {new_tag}")
             notify(f"Updated: {container}", f"{container}: {current_tag} → {new_tag}", tags="white_check_mark")
+            send_webhook("update_success", {"container": container, "from_tag": current_tag, "to_tag": new_tag, "status": history_status})
             return {"success": True, "message": f"Updated to {new_tag}"}
 
         # ── COMPOSE FILE ──────────────────────────────────────────────────
@@ -969,12 +1154,14 @@ def update_service(container: str, new_tag: str, job_id: str = None, history_sta
                 set_compose_image_tag(compose_file, compose_svc, old_tag)
                 run_compose_up(compose_file, compose_svc)
                 notify(f"Update Failed: {container}", f"Rolled back to {old_tag}", priority="4", tags="warning")
+                send_webhook("update_failed", {"container": container, "attempted_tag": new_tag, "rolled_back_to": old_tag})
                 return {"success": False, "error": "Health check failed — auto-rolled back"}
 
             add_to_history(container, new_tag, status=history_status)
             clear_available_update(container)
             jl(f"Done! {current_tag} → {new_tag}")
             notify(f"Updated: {container}", f"{container}: {current_tag} → {new_tag}", tags="white_check_mark")
+            send_webhook("update_success", {"container": container, "from_tag": current_tag, "to_tag": new_tag, "status": history_status})
             return {"success": True, "message": f"Updated to {new_tag}"}
 
         # ── DOCKER API ────────────────────────────────────────────────────
@@ -997,12 +1184,14 @@ def update_service(container: str, new_tag: str, job_id: str = None, history_sta
                 except Exception:
                     pass
                 notify(f"Update Failed: {container}", f"Rolled back to {current_tag}", priority="4", tags="warning")
+                send_webhook("update_failed", {"container": container, "attempted_tag": new_tag, "rolled_back_to": current_tag})
                 return {"success": False, "error": "Health check failed — auto-rolled back"}
 
             add_to_history(container, new_tag, status=history_status)
             clear_available_update(container)
             jl(f"Done! {current_tag} → {new_tag}")
             notify(f"Updated: {container}", f"{container}: {current_tag} → {new_tag}", tags="white_check_mark")
+            send_webhook("update_success", {"container": container, "from_tag": current_tag, "to_tag": new_tag, "status": history_status})
             return {"success": True, "message": f"Updated to {new_tag}"}
 
     except Exception as exc:
@@ -1042,7 +1231,28 @@ def rollback_service(container: str, target_tag: str = None, job_id: str = None)
 # Background checker
 # ---------------------------------------------------------------------------
 
-def _check_once(job_id: str = None):
+def _check_one_container(item: dict, cfg: dict, job_id: str = None) -> tuple:
+    """Check a single container item for updates. Returns (container, current, latest) or None."""
+    container   = item["container"]
+    image       = item["image"]
+    current_tag = item["current_tag"]
+    if image == "unknown":
+        return None
+    _jlog(job_id, f"Checking {container} ({current_tag})...")
+    latest = get_latest_tag(image, current_tag)
+    if latest and latest != current_tag and not is_dismissed(container, latest):
+        _jlog(job_id, f"  → Update available: {latest}")
+        save_available_update(container, latest)
+        return (container, current_tag, latest)
+    else:
+        if latest and is_dismissed(container, latest):
+            _jlog(job_id, f"  → {latest} available but dismissed")
+        else:
+            _jlog(job_id, f"  → Up to date")
+        return None
+
+
+def _check_once(job_id: str = None, target_container: str = None):
     global _last_check_time
 
     # Debounce: only one check at a time
@@ -1056,35 +1266,35 @@ def _check_once(job_id: str = None):
 
     cfg = get_all_settings()
     try:
-        containers  = get_monitored_containers()
+        all_containers = get_monitored_containers()
+        # Filter to single container if requested
+        containers = [c for c in all_containers if c["container"] == target_container]                      if target_container else all_containers
+
+        if not containers and target_container:
+            jl(f"Container '{target_container}' not found or not monitored", "warn")
+            return
+
         updates_found = []
         jl(f"Checking {len(containers)} container(s)...")
 
         for item in containers:
-            container   = item["container"]
-            image       = item["image"]
-            current_tag = item["current_tag"]
-            if image == "unknown":
-                continue
-            jl(f"Checking {container} ({current_tag})...")
-            latest = get_latest_tag(image, current_tag)
-            if latest and latest != current_tag:
-                jl(f"  → Update available: {latest}")
-                save_available_update(container, latest)
-                updates_found.append((container, current_tag, latest))
+            result = _check_one_container(item, cfg, job_id)
+            if result:
+                updates_found.append(result)
+                container, current_tag, latest = result
                 if cfg["auto_update"]:
                     jl(f"  → AUTO_UPDATE: applying {latest}...")
-                    result = update_service(container, latest, job_id=job_id)
-                    if not result["success"]:
-                        jl(f"  → Auto-update failed: {result['error']}", "error")
-            else:
-                jl(f"  → Up to date")
+                    res = update_service(container, latest, job_id=job_id)
+                    if not res["success"]:
+                        jl(f"  → Auto-update failed: {res['error']}", "error")
 
         _last_check_time = time.time()
 
         if updates_found and not cfg["auto_update"]:
             lines = "\n".join(f"- {n}: {c} → {l}" for n, c, l in updates_found)
             notify(f"{len(updates_found)} update(s) available", f"Updates ready:\n{lines}")
+            send_webhook("updates_found", {"count": len(updates_found),
+                         "updates": [{"container": n, "from": c, "to": l} for n, c, l in updates_found]})
             jl(f"Found {len(updates_found)} update(s). Notifications sent.")
         elif not updates_found:
             jl("All containers are up to date.")
@@ -1124,6 +1334,53 @@ def _check_persistence() -> bool:
 # Flask app + HTML template
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
+
+import base64 as _base64
+from functools import wraps
+
+def _require_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not BASIC_AUTH_USER:
+            return f(*args, **kwargs)
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Basic "):
+            try:
+                creds = _base64.b64decode(auth[6:]).decode("utf-8")
+                user, _, passwd = creds.partition(":")
+                if user == BASIC_AUTH_USER and passwd == BASIC_AUTH_PASS:
+                    return f(*args, **kwargs)
+            except Exception:
+                pass
+        return Response(
+            "Authentication required",
+            status=401,
+            headers={"WWW-Authenticate": 'Basic realm="DUMMY"'},
+        )
+    return decorated
+
+# Apply auth globally
+@app.before_request
+def _check_auth():
+    if not BASIC_AUTH_USER:
+        return  # auth disabled
+    # Allow health endpoint without auth (for Docker HEALTHCHECK)
+    if request.path == "/health":
+        return
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Basic "):
+        try:
+            creds = _base64.b64decode(auth[6:]).decode("utf-8")
+            user, _, passwd = creds.partition(":")
+            if user == BASIC_AUTH_USER and passwd == BASIC_AUTH_PASS:
+                return  # authenticated
+        except Exception:
+            pass
+    return Response(
+        "Authentication required",
+        status=401,
+        headers={"WWW-Authenticate": 'Basic realm="DUMMY"'},
+    )
 
 HTML = r"""<!DOCTYPE html>
 <html lang="en" data-theme="dark">
@@ -1327,6 +1584,30 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
          border:2px solid var(--border-2);border-top-color:var(--accent);
          border-radius:50%;animation:spin .7s linear infinite;flex-shrink:0}
 
+/* ── Search / filter bar ─────────────────────────────────────────────────── */
+.filter-bar{display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
+.filter-input{flex:1;min-width:160px;background:var(--surface-2);
+              border:1px solid var(--border-2);border-radius:8px;
+              padding:8px 12px;color:var(--text-hi);font-size:.87em;outline:none;
+              transition:border-color .2s}
+.filter-input:focus{border-color:var(--accent)}
+.filter-input::placeholder{color:var(--text-lo)}
+.btn-filter{padding:7px 14px;font-size:.82em}
+.btn-filter.active{background:var(--accent-2);color:#fff;border-color:var(--accent-2)}
+.card.hidden{display:none}
+
+/* ── Pinned badge ─────────────────────────────────────────────────────────── */
+.b-pinned{background:rgba(148,163,184,.1);color:var(--text-md);
+          border:1px solid rgba(148,163,184,.25);font-size:.68em}
+
+/* ── Dismiss button ───────────────────────────────────────────────────────── */
+.btn-dismiss{background:rgba(100,116,139,.12);color:var(--text-lo);
+             border:1px solid rgba(100,116,139,.2)}
+.btn-dismiss:hover{background:rgba(100,116,139,.25);color:var(--text-md)}
+
+/* ── Checked-at row ───────────────────────────────────────────────────────── */
+.checked-at{font-size:.75em;color:var(--text-lo);margin-top:4px;font-style:italic}
+
 /* ── Setup box (empty state) ─────────────────────────────────────────────── */
 .setup-box{background:rgba(99,102,241,.07);border:1px solid rgba(99,102,241,.2);
            border-radius:14px;padding:28px;text-align:center;color:var(--text-md)}
@@ -1474,6 +1755,16 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
   </div>
   {% endif %}
 
+  <!-- ── Filter bar ──────────────────────────────────────────────────────── -->
+  {% if containers %}
+  <div class="filter-bar">
+    <input class="filter-input" id="filter-input" type="text"
+           placeholder="&#128269; Filter containers..." oninput="filterCards()">
+    <button class="btn btn-ghost btn-filter" id="btn-filter-updates"
+            onclick="toggleFilterUpdates()">Updates only</button>
+  </div>
+  {% endif %}
+
   <!-- ── Container cards ──────────────────────────────────────────────────── -->
   {% if containers %}
     {% for u in containers %}
@@ -1490,7 +1781,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
             {{ u.status }}
           </span>
           <span class="badge b-strategy">{{ u.strategy_label }}</span>
-          {% if u.has_update %}
+          {% if u.pinned %}
+          <span class="badge b-pinned">&#128274; PINNED</span>
+          {% elif u.has_update %}
           <span class="badge b-update">&#x2B06; {{ u.available_tag }}</span>
           {% endif %}
         </div>
@@ -1549,6 +1842,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
                     onclick="doUpdate('{{ u.container }}','{{ u.available_tag }}')">
               &#x2B06; Update to {{ u.available_tag }}
             </button>
+            <button class="btn btn-dismiss btn-sm"
+                    onclick="dismissUpdate('{{ u.container }}','{{ u.available_tag }}')"
+                    title="Hide this update">
+              &#x2715; Dismiss
+            </button>
             {% endif %}
             {% if u.changelog %}
             <a class="btn btn-ghost"
@@ -1557,6 +1855,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
             </a>
             {% endif %}
           </div>
+          {% if u.checked_at %}
+          <div class="checked-at">Last checked: {{ u.checked_at[:16]|replace("T"," ") }}</div>
+          {% endif %}
 
         </div>
       </div>
@@ -1955,6 +2256,44 @@ function escHtml(s){
     .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+// ── Filter / search ─────────────────────────────────────────────────────────
+let _filterUpdatesOnly = false;
+
+function filterCards(){
+  const q = (document.getElementById('filter-input').value || '').toLowerCase();
+  document.querySelectorAll('.card[id^="card-"]').forEach(card => {
+    const name = card.id.replace('card-', '').toLowerCase();
+    const hasUpdate = card.classList.contains('has-update');
+    const matchText = !q || name.includes(q);
+    const matchFilter = !_filterUpdatesOnly || hasUpdate;
+    card.classList.toggle('hidden', !matchText || !matchFilter);
+  });
+}
+
+function toggleFilterUpdates(){
+  _filterUpdatesOnly = !_filterUpdatesOnly;
+  const btn = document.getElementById('btn-filter-updates');
+  if(btn) btn.classList.toggle('active', _filterUpdatesOnly);
+  filterCards();
+}
+
+// ── Dismiss ──────────────────────────────────────────────────────────────────
+async function dismissUpdate(container, tag){
+  if(!confirm(`Dismiss update to ${tag} for ${container}?
+
+It won't appear again until a newer version is found.`)) return;
+  try {
+    await fetch('/api/dismiss', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({container, tag})
+    });
+    location.reload();
+  } catch(e) {
+    alert('Dismiss failed: ' + e.message);
+  }
+}
+
 // ── Init ─────────────────────────────────────────────────────────────────────
 initTheme();
 initStatus();
@@ -2105,10 +2444,12 @@ def api_check():
     if _check_running.is_set():
         return jsonify({"success": False, "error": "A check is already running"}), 429
 
-    job_id = _new_job()
+    data      = request.json or {}
+    target    = data.get("container")   # optional: check just one container
+    job_id    = _new_job()
 
     def run():
-        _check_once(job_id=job_id)
+        _check_once(job_id=job_id, target_container=target)
         _job_done(job_id, True, message="Check complete")
 
     threading.Thread(target=run, daemon=True).start()
@@ -2126,7 +2467,7 @@ def api_containers():
 @app.route("/api/history/export")
 def api_history_export():
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = _get_conn()
         c = conn.cursor()
         c.execute("SELECT container, tag, deployed_at, status FROM version_history ORDER BY deployed_at ASC")
         rows = c.fetchall()
@@ -2149,7 +2490,7 @@ def api_history_import():
         rows = data.get("history", [])
         if not rows:
             return jsonify({"success": False, "error": "No history entries in payload"})
-        conn = sqlite3.connect(DB_PATH)
+        conn = _get_conn()
         c = conn.cursor()
         inserted = skipped = 0
         for row in rows:
@@ -2178,6 +2519,28 @@ def api_container_history(container):
     return jsonify(get_history(container))
 
 
+@app.route("/api/dismiss", methods=["POST"])
+def api_dismiss():
+    data      = request.json or {}
+    container = data.get("container")
+    tag       = data.get("tag")
+    if not container or not tag:
+        return jsonify({"success": False, "error": "Missing container or tag"})
+    dismiss_update(container, tag)
+    return jsonify({"success": True})
+
+
+@app.route("/api/undismiss", methods=["POST"])
+def api_undismiss():
+    data      = request.json or {}
+    container = data.get("container")
+    tag       = data.get("tag")
+    if not container:
+        return jsonify({"success": False, "error": "Missing container"})
+    undismiss_update(container, tag)
+    return jsonify({"success": True})
+
+
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "containers_monitored": len(get_monitored_containers())})
@@ -2193,4 +2556,4 @@ if __name__ == "__main__":
     init_db()
     _next_check_time = time.time() + CHECK_INTERVAL
     threading.Thread(target=check_for_updates, daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
