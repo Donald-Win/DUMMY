@@ -1358,6 +1358,16 @@ app = Flask(__name__)
 
 import base64 as _base64
 from functools import wraps
+from flask import abort
+from werkzeug.exceptions import HTTPException
+
+@app.errorhandler(Exception)
+def _handle_exception(exc):
+    """Return all unhandled exceptions as JSON so the UI always gets parseable responses."""
+    if isinstance(exc, HTTPException):
+        return jsonify({"success": False, "error": exc.description, "status": exc.code}), exc.code
+    log.error("Unhandled exception: %s", exc, exc_info=True)
+    return jsonify({"success": False, "error": "Internal server error", "status": 500}), 500
 
 def _require_auth(f):
     @wraps(f)
@@ -2130,8 +2140,20 @@ async function checkNow(){
   openModal('Checking for updates...');
 
   try {
-    const r = await fetch('/api/check', {method:'POST'});
+    const r = await fetch('/api/check', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
+    });
+    // Guard against non-JSON responses (e.g. Caddy redirect → 405 HTML page)
+    const ct = r.headers.get('Content-Type') || '';
+    if (!ct.includes('application/json')) {
+      const text = await r.text();
+      const hint = r.status === 405 ? ' (HTTP 405 — possible proxy redirect issue)' :
+                   r.status === 301 || r.status === 302 ? ' (redirect — check proxy config)' : '';
+      throw new Error(`Server returned HTTP ${r.status}${hint}`);
+    }
     const d = await r.json();
+    if (d.error) throw new Error(d.error);
     const jobId = d.job_id;
     if(jobId){
       const result = await pollJob(jobId);
