@@ -747,22 +747,42 @@ def read_env() -> dict:
 
 
 def write_env_var(var: str, value: str) -> bool:
+    """
+    Update a variable in the .env file, preserving all other content.
+    Handles all common .env formats:
+      VAR=value
+      VAR = value      (spaces around =)
+      VAR=             (empty value)
+      export VAR=value (export prefix)
+    Write is atomic via a temp file + rename.
+    """
+    import re as _re
+    # Matches: optional 'export ', the var name, optional spaces, '=', anything
+    pattern = _re.compile(
+        r"^(export\s+)?" + _re.escape(var) + r"\s*=.*$"
+    )
     try:
         with open(ENV_FILE) as f:
             lines = f.readlines()
         for i, line in enumerate(lines):
-            if line.startswith(f"{var}="):
-                lines[i] = f"{var}={value}\n"
-                # Atomic write: write to a temp file then rename so a
-                # power failure mid-write never leaves the .env corrupted
+            if pattern.match(line.rstrip("\n\r")):
+                # Preserve 'export ' prefix if present
+                prefix = "export " if line.lstrip().startswith("export ") else ""
+                lines[i] = f"{prefix}{var}={value}\n"
                 tmp = ENV_FILE + ".tmp"
                 with open(tmp, "w") as f:
                     f.writelines(lines)
                 os.replace(tmp, ENV_FILE)
+                log.debug("write_env_var: set %s=%s", var, value)
                 return True
-        log.warning("write_env_var: %s not found in %s", var, ENV_FILE)
+        log.warning("write_env_var: %s not found in %s — check the variable name matches exactly", var, ENV_FILE)
+        return False
+    except PermissionError:
+        log.error("write_env_var: no write permission on %s — check the volume is not mounted :ro", ENV_FILE)
+    except OSError as exc:
+        log.error("write_env_var: OS error writing %s: %s", ENV_FILE, exc)
     except Exception as exc:
-        log.error("write_env_var: %s", exc)
+        log.error("write_env_var: unexpected error: %s", exc)
     return False
 
 
@@ -1102,7 +1122,7 @@ def update_service(container: str, new_tag: str, job_id: str = None, history_sta
 
             jl(f"Writing {var}={new_tag} to .env...")
             if not write_env_var(var, new_tag):
-                return {"success": False, "error": f"Failed to write {var} to {ENV_FILE}"}
+                return {"success": False, "error": f"Failed to write {var} to {ENV_FILE} — check DUMMY logs for details (common cause: volume mounted :ro)"}
 
             jl(f"Pulling {image}:{new_tag}...")
             try:
