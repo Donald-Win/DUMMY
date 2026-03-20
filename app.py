@@ -1281,6 +1281,7 @@ def _check_once(job_id: str = None, target_container: str = None):
         _jlog(job_id, "A check is already in progress — skipping", "warn")
         return
     _check_running.set()
+    _check_running._set_at = time.time()   # timestamp for stuck-flag detection
 
     def jl(msg, level="info"):
         _jlog(job_id, msg, level)
@@ -2158,6 +2159,9 @@ async function checkNow(){
     if(jobId){
       const result = await pollJob(jobId);
       modalDone(true, result && result.message ? result.message : 'Check complete');
+    } else {
+      // No job id returned — shouldn't happen but fail gracefully
+      throw new Error('No job ID returned from server');
     }
   } catch(e){
     appendLog('Error: ' + e.message, 'error');
@@ -2249,7 +2253,11 @@ function openModal(title){
   document.getElementById('modal-title').textContent = title;
   document.getElementById('modal-icon').innerHTML = '<div class="spinner"></div>';
   document.getElementById('modal-log').innerHTML = '';
-  document.getElementById('modal-close').disabled = true;
+  const close = document.getElementById('modal-close');
+  close.disabled = true;
+  close.textContent = 'Close';
+  close.className = 'btn btn-ghost';
+  close.onclick = () => closeModal(false);
   document.getElementById('overlay').classList.add('visible');
   _lastLogCount = 0;
 }
@@ -2485,7 +2493,16 @@ def api_rollback():
 @app.route("/api/check", methods=["POST"])
 def api_check():
     if _check_running.is_set():
-        return jsonify({"success": False, "error": "A check is already running"}), 429
+        # Safety: if the flag has been stuck for >15 minutes, clear it
+        # (guards against a crashed check leaving the flag set permanently)
+        if hasattr(_check_running, "_set_at"):
+            if time.time() - _check_running._set_at > 900:
+                log.warning("check_running flag stuck for >15min — force-clearing")
+                _check_running.clear()
+            else:
+                return jsonify({"success": False, "error": "A check is already in progress — try again shortly"}), 429
+        else:
+            return jsonify({"success": False, "error": "A check is already in progress — try again shortly"}), 429
 
     data      = request.json or {}
     target    = data.get("container")   # optional: check just one container
