@@ -769,10 +769,11 @@ def write_env_var(var: str, value: str) -> bool:
                 # Preserve 'export ' prefix if present
                 prefix = "export " if line.lstrip().startswith("export ") else ""
                 lines[i] = f"{prefix}{var}={value}\n"
-                tmp = ENV_FILE + ".tmp"
-                with open(tmp, "w") as f:
+                # Write directly — single-file bind mounts prevent atomic
+                # rename across overlay/host filesystem boundary (EXDEV).
+                # The file is small so direct write is safe here.
+                with open(ENV_FILE, "w") as f:
                     f.writelines(lines)
-                os.replace(tmp, ENV_FILE)
                 log.debug("write_env_var: set %s=%s", var, value)
                 return True
         log.warning("write_env_var: %s not found in %s — check the variable name matches exactly", var, ENV_FILE)
