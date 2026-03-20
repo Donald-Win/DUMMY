@@ -2144,6 +2144,7 @@ async function checkNow(){
     const r = await fetch('/api/check', {
       method: 'POST',
       headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
+      body: JSON.stringify({}),
     });
     // Guard against non-JSON responses (e.g. Caddy redirect → 405 HTML page)
     const ct = r.headers.get('Content-Type') || '';
