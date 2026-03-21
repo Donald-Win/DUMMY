@@ -1125,20 +1125,28 @@ def update_service(container: str, new_tag: str, job_id: str = None, history_sta
             if not write_env_var(var, new_tag):
                 return {"success": False, "error": f"Failed to write {var} to {ENV_FILE} — check DUMMY logs for details (common cause: volume mounted :ro)"}
 
-            jl(f"Pulling {image}:{new_tag}...")
-            try:
-                client.images.pull(image, tag=new_tag)
-            except Exception as exc:
+            # Recreate the container with the new image rather than just
+            # restarting — restart keeps the old image baked into the
+            # container spec and the new tag is never actually used.
+            jl(f"Recreating container with {image}:{new_tag}...")
+            ok, err = recreate_container(
+                client, container_obj, f"{image}:{new_tag}",
+                jlog=lambda m: jl(m)
+            )
+            if not ok:
+                # Recreate failed — restore .env to old tag
                 write_env_var(var, current_tag)
-                return {"success": False, "error": f"Pull failed: {exc}"}
-
-            jl("Restarting container...")
-            container_obj.restart()
+                return {"success": False, "error": err}
 
             if not check_container_health(container, jlog=jl):
                 jl(f"Rolling back — restoring {var}={current_tag}", "warn")
                 write_env_var(var, current_tag)
-                container_obj.restart()
+                try:
+                    failed_obj = get_docker_client().containers.get(container)
+                    recreate_container(client, failed_obj, f"{image}:{current_tag}",
+                                       jlog=lambda m: jl(m))
+                except Exception:
+                    pass
                 check_container_health(container, timeout=30)
                 notify(f"Update Failed: {container}", f"Rolled back to {current_tag}", priority="4", tags="warning")
                 send_webhook("update_failed", {"container": container, "attempted_tag": new_tag, "rolled_back_to": current_tag})
