@@ -84,9 +84,19 @@ _docker_client = None
 _docker_lock   = threading.Lock()
 
 def get_docker_client():
+    """
+    Return a connected Docker client, reconnecting automatically if the
+    previous connection is stale (e.g. after a Docker daemon restart).
+    """
     global _docker_client
     if _docker_client is not None:
-        return _docker_client
+        try:
+            _docker_client.ping()   # lightweight liveness check
+            return _docker_client
+        except Exception:
+            log.warning("Docker client connection lost — reconnecting...")
+            with _docker_lock:
+                _docker_client = None
     with _docker_lock:
         if _docker_client is None:
             _docker_client = dockerlib.from_env()
@@ -119,7 +129,8 @@ _next_check_time: float = 0.0
 # Active operation guard — prevents two simultaneous updates on the same container
 _active_containers: set = set()
 _active_lock = threading.Lock()
-_check_running = threading.Event()   # set while a check is in progress
+_check_running    = threading.Event() # set while a check is in progress
+_check_started_at : float = 0.0       # timestamp when check started (stuck-flag detection)
 
 
 def _new_job() -> str:
@@ -800,21 +811,8 @@ def read_compose(path: str):
         return None
 
 
-def write_compose(path: str, data: dict) -> bool:
-    try:
-        # Atomic write: temp file then rename so a power failure mid-write
-        # never leaves the compose file in a partially-written state
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-        os.replace(tmp, path)
-        return True
-    except Exception as exc:
-        log.error("write_compose %s: %s", path, exc)
-        return False
-
-
 def get_compose_image_tag(compose_path: str, service_name: str):
+    """Read current image tag for a service from the compose file."""
     data = read_compose(compose_path)
     if not data:
         return None
@@ -823,16 +821,84 @@ def get_compose_image_tag(compose_path: str, service_name: str):
 
 
 def set_compose_image_tag(compose_path: str, service_name: str, new_tag: str):
-    data = read_compose(compose_path)
-    if not data:
+    """
+    Update a service's image tag in the compose file using line-by-line
+    regex replacement. This preserves comments, formatting, key order,
+    and quote styles — yaml.dump would destroy all of that.
+
+    Returns (success, old_tag).
+    """
+    import re as _re
+    try:
+        with open(compose_path) as f:
+            lines = f.readlines()
+    except Exception as exc:
+        log.error("set_compose_image_tag read %s: %s", compose_path, exc)
         return False, ""
-    service = data.get("services", {}).get(service_name)
-    if not service:
+
+    # First pass: find the service block and its indentation
+    svc_indent = None
+    in_service = False
+    for line in lines:
+        stripped = line.lstrip()
+        indent   = len(line) - len(stripped)
+        if stripped.startswith(f"{service_name}:"):
+            svc_indent = indent
+            in_service = True
+            continue
+        if in_service:
+            if stripped and indent <= svc_indent and not stripped.startswith("#"):
+                break   # left the service block
+            m = _re.match(r"(\s*image\s*:\s*)(.+)", line)
+            if m:
+                old_image = m.group(2).strip().strip("'\"")
+                base, old_tag = old_image.rsplit(":", 1) if ":" in old_image else (old_image, "latest")
+                break
+    else:
+        old_tag = "unknown"
+
+    if svc_indent is None:
+        log.error("set_compose_image_tag: service %r not found in %s", service_name, compose_path)
         return False, ""
-    old_image = service.get("image", "")
-    base, old_tag = old_image.rsplit(":", 1) if ":" in old_image else (old_image, "latest")
-    service["image"] = f"{base}:{new_tag}"
-    return write_compose(compose_path, data), old_tag
+
+    # Second pass: rewrite the image line inside the service block
+    svc_indent   = None
+    in_service   = False
+    replaced     = False
+    new_lines    = []
+    for line in lines:
+        stripped = line.lstrip()
+        indent   = len(line) - len(stripped)
+        if stripped.startswith(f"{service_name}:"):
+            svc_indent = indent
+            in_service = True
+            new_lines.append(line)
+            continue
+        if in_service and not replaced:
+            if stripped and indent <= svc_indent and not stripped.startswith("#"):
+                in_service = False   # left the service block without finding image
+            else:
+                m = _re.match(r"(\s*image\s*:\s*)(.+)", line)
+                if m:
+                    old_image = m.group(2).strip().strip("'\"")
+                    base = old_image.rsplit(":", 1)[0] if ":" in old_image else old_image
+                    new_lines.append(f"{m.group(1)}{base}:{new_tag}\n")
+                    replaced = True
+                    continue
+        new_lines.append(line)
+
+    if not replaced:
+        log.error("set_compose_image_tag: image line not found for %r in %s", service_name, compose_path)
+        return False, old_tag
+
+    try:
+        with open(compose_path, "w") as f:
+            f.writelines(new_lines)
+        log.debug("set_compose_image_tag: %s → %s:%s", service_name, base, new_tag)
+        return True, old_tag
+    except Exception as exc:
+        log.error("set_compose_image_tag write %s: %s", compose_path, exc)
+        return False, old_tag
 
 
 def run_compose_up(compose_path: str, service_name: str):
@@ -951,8 +1017,21 @@ def check_container_health(container_name: str, timeout: int = None, jlog=None) 
     if jlog:
         jlog(f"Health check — waiting up to {timeout}s...")
     try:
-        client    = get_docker_client()
-        container = client.containers.get(container_name)
+        client = get_docker_client()
+        # Retry the initial containers.get() — Docker may not have registered
+        # the new container immediately after recreate_container returns.
+        container = None
+        for _attempt in range(6):
+            try:
+                container = client.containers.get(container_name)
+                break
+            except dockerlib.errors.NotFound:
+                if _attempt < 5:
+                    time.sleep(1)
+        if container is None:
+            if jlog:
+                jlog(f"Container {container_name} not found after recreate", "error")
+            return False
         deadline  = time.time() + timeout
         while time.time() < deadline:
             container.reload()
@@ -1012,32 +1091,107 @@ def _resolve_strategy(container_name: str, dummy_labels: dict) -> dict:
     return {"strategy": STRATEGY_DOCKER_API}
 
 
-def get_container_checked_at(container: str) -> str:
-    """Return the checked_at timestamp for a container, or empty string."""
+def _fetch_container_data_bulk(container_names: list) -> dict:
+    """
+    Single DB round-trip to load available_updates, version_history, and
+    dismissed_updates for all monitored containers at once.
+    Returns a dict keyed by container name.
+    """
+    if not container_names:
+        return {}
     try:
+        limit = get_all_settings()["history_limit"]
+        placeholders = ",".join("?" * len(container_names))
         conn = _get_conn()
         c = conn.cursor()
-        c.execute("SELECT checked_at FROM available_updates WHERE container=?", (container,))
-        row = c.fetchone()
+
+        # available_updates
+        c.execute(f"SELECT container, available_tag, checked_at FROM available_updates "
+                  f"WHERE container IN ({placeholders})", container_names)
+        avail = {row[0]: (row[1], row[2]) for row in c.fetchall()}
+
+        # version_history — fetch all rows then trim per container in Python
+        c.execute(f"SELECT container, tag, deployed_at, status FROM version_history "
+                  f"WHERE container IN ({placeholders}) ORDER BY deployed_at DESC",
+                  container_names)
+        hist_raw: dict = {}
+        for row in c.fetchall():
+            hist_raw.setdefault(row[0], []).append(
+                {"tag": row[1], "date": row[2], "status": row[3]}
+            )
+        history = {k: v[:limit] for k, v in hist_raw.items()}
+
+        # dismissed_updates
+        c.execute(f"SELECT container, tag, dismissed_at FROM dismissed_updates "
+                  f"WHERE container IN ({placeholders}) ORDER BY dismissed_at DESC",
+                  container_names)
+        dismissed: dict = {}
+        for row in c.fetchall():
+            dismissed.setdefault(row[0], []).append(
+                {"tag": row[1], "dismissed_at": row[2]}
+            )
+
         conn.close()
-        return row[0] if row else ""
-    except Exception:
-        return ""
+        result = {}
+        for name in container_names:
+            av_tag, checked_at = avail.get(name, (None, ""))
+            dismissed_tags = {d["tag"] for d in dismissed.get(name, [])}
+            # Validate cached tag still passes filter
+            if av_tag and not is_stable_tag(av_tag):
+                av_tag = None
+            result[name] = {
+                "available_tag": av_tag,
+                "checked_at":    checked_at or "",
+                "history":       history.get(name, []),
+                "dismissed":     dismissed.get(name, []),
+                "dismissed_tags": dismissed_tags,
+            }
+        return result
+    except Exception as exc:
+        log.error("_fetch_container_data_bulk: %s", exc)
+        return {}
+
+
+# .env cache — avoid re-reading from disk on every page load
+_env_cache: dict = {}
+_env_cache_mtime: float = 0.0
+
+def read_env_cached() -> dict:
+    """Return .env contents, re-reading only when the file has changed."""
+    global _env_cache, _env_cache_mtime
+    try:
+        mtime = os.path.getmtime(ENV_FILE)
+        if mtime != _env_cache_mtime:
+            _env_cache = read_env()
+            _env_cache_mtime = mtime
+    except OSError:
+        pass   # file missing — return whatever we have
+    return _env_cache
 
 
 def get_monitored_containers() -> list:
     items = []
     try:
         client   = get_docker_client()
-        env_vars = read_env()
+        env_vars = read_env_cached()
 
+        # Collect all monitored containers first (no DB yet)
+        candidates = []
         for c in client.containers.list():
             dummy_labels   = _get_dummy_labels(c)
             in_version_map = c.name in VERSION_MAP
-
             if dummy_labels.get("enable", "").lower() != "true" and not in_version_map:
                 continue
+            candidates.append((c, dummy_labels))
 
+        if not candidates:
+            return []
+
+        # Single DB round-trip for all container data
+        names    = [c.name for c, _ in candidates]
+        db_data  = _fetch_container_data_bulk(names)
+
+        for c, dummy_labels in candidates:
             image, tag   = get_image_parts(c)
             strategy_cfg = _resolve_strategy(c.name, dummy_labels)
             strategy     = strategy_cfg["strategy"]
@@ -1050,33 +1204,34 @@ def get_monitored_containers() -> list:
             else:
                 current_tag = tag
 
-            available_tag = get_available_update(c.name) if not pinned else None
-            history       = get_history(c.name)
-            dismissed     = get_dismissed(c.name)
-            checked_at    = get_container_checked_at(c.name)
+            d             = db_data.get(c.name, {})
+            available_tag = d.get("available_tag") if not pinned else None
+            dismissed_tags= d.get("dismissed_tags", set())
 
-            # An update is actionable only if it exists, differs, and is not dismissed
+            # Suppress dismissed available tag from display
+            if available_tag and available_tag in dismissed_tags:
+                available_tag = None
+
             has_update = bool(
                 available_tag
                 and available_tag != current_tag
                 and not pinned
-                and not is_dismissed(c.name, available_tag)
             )
 
             items.append({
                 "container":      c.name,
                 "image":          image,
                 "current_tag":    current_tag,
-                "available_tag":  available_tag if not is_dismissed(c.name, available_tag or "") else None,
+                "available_tag":  available_tag,
                 "has_update":     has_update,
                 "pinned":         pinned,
                 "status":         c.status,
                 "strategy":       strategy,
                 "strategy_label": STRATEGY_LABELS[strategy],
                 "changelog":      get_changelog(image, dummy_labels.get("changelog")),
-                "history":        history,
-                "dismissed":      dismissed,
-                "checked_at":     checked_at,
+                "history":        d.get("history", []),
+                "dismissed":      d.get("dismissed", []),
+                "checked_at":     d.get("checked_at", ""),
                 "_strategy_cfg":  strategy_cfg,
             })
 
@@ -1167,6 +1322,14 @@ def update_service(container: str, new_tag: str, job_id: str = None, history_sta
             jl(f"Current:    {current_tag}")
             add_to_history(container, current_tag, status="previous")
 
+            # Snapshot the original lines before touching the file so we
+            # can reliably restore even if the rollback file-edit also fails.
+            try:
+                with open(compose_file) as _f:
+                    _original_compose_lines = _f.readlines()
+            except Exception as _exc:
+                return {"success": False, "error": f"Cannot read {compose_file}: {_exc}"}
+
             jl(f"Editing image tag in {compose_file}...")
             ok, old_tag = set_compose_image_tag(compose_file, compose_svc, new_tag)
             if not ok:
@@ -1175,13 +1338,22 @@ def update_service(container: str, new_tag: str, job_id: str = None, history_sta
             jl(f"Running: docker compose up -d {compose_svc}")
             ok, err = run_compose_up(compose_file, compose_svc)
             if not ok:
-                set_compose_image_tag(compose_file, compose_svc, old_tag)
+                jl("Restoring compose file from snapshot...", "warn")
+                try:
+                    with open(compose_file, "w") as _f:
+                        _f.writelines(_original_compose_lines)
+                except Exception:
+                    pass
                 return {"success": False, "error": f"docker compose up failed: {err}"}
 
             if not check_container_health(container, jlog=jl):
-                jl("Rolling back compose file...", "warn")
-                set_compose_image_tag(compose_file, compose_svc, old_tag)
-                run_compose_up(compose_file, compose_svc)
+                jl("Rolling back compose file from snapshot...", "warn")
+                try:
+                    with open(compose_file, "w") as _f:
+                        _f.writelines(_original_compose_lines)
+                    run_compose_up(compose_file, compose_svc)
+                except Exception:
+                    pass
                 notify(f"Update Failed: {container}", f"Rolled back to {old_tag}", priority="4", tags="warning")
                 send_webhook("update_failed", {"container": container, "attempted_tag": new_tag, "rolled_back_to": old_tag})
                 return {"success": False, "error": "Health check failed — auto-rolled back"}
@@ -1257,6 +1429,35 @@ def rollback_service(container: str, target_tag: str = None, job_id: str = None)
 
 
 # ---------------------------------------------------------------------------
+# Stale data cleanup
+# ---------------------------------------------------------------------------
+
+def cleanup_stale_containers():
+    """
+    Remove available_updates and dismissed_updates rows for containers that
+    no longer exist in Docker. Runs at startup and periodically.
+    History is kept — it's useful even after a container is removed.
+    """
+    try:
+        client = get_docker_client()
+        live   = {c.name for c in client.containers.list(all=True)}
+        conn   = _get_conn()
+        c      = conn.cursor()
+        c.execute("SELECT DISTINCT container FROM available_updates")
+        stale  = [r[0] for r in c.fetchall() if r[0] not in live]
+        if stale:
+            placeholders = ",".join("?" * len(stale))
+            c.execute(f"DELETE FROM available_updates WHERE container IN ({placeholders})", stale)
+            c.execute(f"DELETE FROM dismissed_updates WHERE container IN ({placeholders})", stale)
+            conn.commit()
+            log.info("Cleaned up stale rows for %d removed container(s): %s",
+                     len(stale), ", ".join(stale))
+        conn.close()
+    except Exception as exc:
+        log.warning("cleanup_stale_containers: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Background checker
 # ---------------------------------------------------------------------------
 
@@ -1289,7 +1490,8 @@ def _check_once(job_id: str = None, target_container: str = None):
         _jlog(job_id, "A check is already in progress — skipping", "warn")
         return
     _check_running.set()
-    _check_running._set_at = time.time()   # timestamp for stuck-flag detection
+    global _check_started_at
+    _check_started_at = time.time()
 
     def jl(msg, level="info"):
         _jlog(job_id, msg, level)
@@ -1338,9 +1540,12 @@ def _check_once(job_id: str = None, target_container: str = None):
 
 def check_for_updates():
     global _next_check_time
+    # Clean up stale rows on first run
+    cleanup_stale_containers()
     while True:
         log.info("Running update check...")
         _check_once()
+        cleanup_stale_containers()   # clean up after each check too
         interval = get_all_settings()["check_interval"]
         _next_check_time = time.time() + interval
         time.sleep(interval)
@@ -1639,6 +1844,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
 /* ── Pinned badge ─────────────────────────────────────────────────────────── */
 .b-pinned{background:rgba(148,163,184,.1);color:var(--text-md);
           border:1px solid rgba(148,163,184,.25);font-size:.68em}
+
+/* ── Updating badge ───────────────────────────────────────────────────────── */
+.b-updating{background:rgba(99,102,241,.2);color:#a5b4fc;
+            border:1px solid rgba(99,102,241,.4);font-size:.68em}
+.card.updating{border-left:3px solid #6366f1;opacity:.85}
 
 /* ── Dismiss button ───────────────────────────────────────────────────────── */
 .btn-dismiss{background:rgba(100,116,139,.12);color:var(--text-lo);
@@ -2030,7 +2240,10 @@ let _countdownTick;
 
 function initStatus(){
   fetchStatus();
-  setInterval(fetchStatus, 30000);
+  // Poll frequently while updates are active, slower otherwise
+  setInterval(async () => {
+    await fetchStatus();
+  }, 5000);
   _countdownTick = setInterval(tickCountdown, 1000);
 }
 
@@ -2042,6 +2255,24 @@ async function fetchStatus(){
     const el = document.getElementById('last-checked');
     if(el) el.textContent = d.last_check_time ? ago(d.last_check_time * 1000) : 'Never';
     tickCountdown();
+    // Mark cards that are currently being updated
+    if(d.active_updates) {
+      document.querySelectorAll('.card[id^="card-"]').forEach(card => {
+        const name = card.id.replace('card-', '');
+        const isActive = d.active_updates.includes(name);
+        card.classList.toggle('updating', isActive);
+        const badge = card.querySelector('.b-updating');
+        if(isActive && !badge){
+          const b = document.createElement('span');
+          b.className = 'badge b-updating';
+          b.textContent = '⟳ UPDATING';
+          const badges = card.querySelector('.badges');
+          if(badges) badges.appendChild(b);
+        } else if(!isActive && badge){
+          badge.remove();
+        }
+      });
+    }
   } catch(e){}
 }
 
@@ -2502,14 +2733,9 @@ def api_rollback():
 @app.route("/api/check", methods=["POST"])
 def api_check():
     if _check_running.is_set():
-        # Safety: if the flag has been stuck for >15 minutes, clear it
-        # (guards against a crashed check leaving the flag set permanently)
-        if hasattr(_check_running, "_set_at"):
-            if time.time() - _check_running._set_at > 900:
-                log.warning("check_running flag stuck for >15min — force-clearing")
-                _check_running.clear()
-            else:
-                return jsonify({"success": False, "error": "A check is already in progress — try again shortly"}), 429
+        if time.time() - _check_started_at > 900:
+            log.warning("check_running flag stuck for >15min — force-clearing")
+            _check_running.clear()
         else:
             return jsonify({"success": False, "error": "A check is already in progress — try again shortly"}), 429
 
