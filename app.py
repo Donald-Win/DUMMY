@@ -367,15 +367,17 @@ def _query_ghcr_registry_api(org: str, repo: str, current_tag: str):
                 url = _parse_link_next(resp.headers.get("Link", ""))
             return tags
 
-        # ── Pass 1: start from current_tag as cursor (fast path) ──────────
-        # Strip leading v/V so the cursor lands at the right alphabetic spot
+        # ── Pass 1: cursor from current_tag ───────────────────────────────
+        # The registry returns tags alphabetically after the cursor, so we
+        # land just past the current version. Fetch 20 pages of 500 (10,000
+        # candidates) which covers even immich's gap of thousands of dev tags
+        # between releases.
         cursor = current_tag.lstrip("vV")
-        # Re-add v prefix if the tag uses it (keeps cursor consistent with tags)
         if current_tag.startswith(("v", "V")):
             cursor = "v" + cursor
         cursor_url = (f"https://ghcr.io/v2/{image_path}/tags/list"
-                      f"?n=200&last={cursor}")
-        all_tags = _fetch_pages(cursor_url, max_pages=3)
+                      f"?n=500&last={cursor}")
+        all_tags = _fetch_pages(cursor_url, max_pages=20)
         result   = _find_newest_tag(all_tags, current_tag)
 
         if result:
@@ -384,6 +386,7 @@ def _query_ghcr_registry_api(org: str, repo: str, current_tag: str):
             return result
 
         # ── Pass 2: fallback forward scan from start ───────────────────────
+        # Handles cases where current_tag cursor is unreliable (e.g. 'latest')
         log.debug("GHCR cursor pass found nothing for %s — trying forward scan",
                   image_path)
         all_tags = _fetch_pages(
