@@ -309,53 +309,93 @@ def _find_newest_tag(tags: list, current_tag: str):
     return newest
 
 
+def _parse_link_next(link_header: str) -> str:
+    """Extract the next page URL from a Link header."""
+    for part in link_header.split(","):
+        part = part.strip()
+        if 'rel="next"' in part:
+            url = part.split(";")[0].strip().strip("<>")
+            # Make absolute if registry returns a relative path
+            if url.startswith("/"):
+                url = "https://ghcr.io" + url
+            return url
+    return ""
+
+
 def _query_ghcr_registry_api(org: str, repo: str, current_tag: str):
     """
-    Fallback: query the Docker Registry v2 API directly on ghcr.io.
-    This works for public images without a GitHub token, using only an
-    anonymous bearer token issued by the registry itself.
-    Follows Link header pagination so all tags are checked.
+    Query the Docker Registry v2 API on ghcr.io.
+
+    Images like immich-server have 20,000+ tags sorted alphabetically.
+    Naive forward pagination would need 20+ pages to reach v2.x tags.
+
+    Strategy:
+      1. Use current_tag as a `last` cursor — the registry returns tags
+         that sort AFTER it alphabetically, so we land exactly where
+         newer versions live. Fetch 3 pages of 200 tags (600 candidates).
+      2. If that finds nothing (e.g. current_tag is not a real version,
+         or the image has no newer tags in that range), fall back to a
+         forward scan from the beginning capped at 5 pages.
+
+    This means 1-3 requests for the common case instead of 10-20+.
     """
     image_path = f"{org}/{repo}"
     try:
-        # Step 1: get an anonymous pull token from the ghcr.io auth service
         tok_resp = _req_get(f"https://ghcr.io/token?scope=repository:{image_path}:pull")
         if tok_resp is None or tok_resp.status_code != 200:
-            log.warning("GHCR registry token %s HTTP %s", image_path, tok_resp.status_code)
+            log.warning("GHCR registry token %s HTTP %s", image_path,
+                        tok_resp.status_code if tok_resp else "no-response")
             return None
         token = tok_resp.json().get("token")
         if not token:
             return None
 
         headers = {"Authorization": f"Bearer {token}"}
-        all_tags = []
-        # Request a large page size; follow Link: rel="next" pagination if present
-        url = f"https://ghcr.io/v2/{image_path}/tags/list?n=1000"
-        page = 0
-        while url and page < 10:   # safety cap at 10 pages (~10 000 tags)
-            page += 1
-            resp = _req_get(url, headers=headers)
-            if resp is None or resp.status_code != 200:
-                log.warning("GHCR registry tags %s page %d HTTP %s",
-                            image_path, page, resp.status_code if resp else "no-response")
-                break
-            all_tags.extend(resp.json().get("tags") or [])
-            # Follow pagination via Link header: <url>; rel="next"
-            link = resp.headers.get("Link", "")
-            url = None
-            for part in link.split(","):
-                part = part.strip()
-                if 'rel="next"' in part:
-                    url = part.split(";")[0].strip().strip("<>")
-                    break
 
-        log.debug("GHCR registry API fetched %d tags for %s over %d page(s)",
-                  len(all_tags), image_path, page)
+        def _fetch_pages(start_url: str, max_pages: int) -> list:
+            tags = []
+            url  = start_url
+            page = 0
+            while url and page < max_pages:
+                page += 1
+                resp = _req_get(url, headers=headers)
+                if resp is None or resp.status_code != 200:
+                    log.warning("GHCR tags %s page %d HTTP %s", image_path, page,
+                                resp.status_code if resp else "no-response")
+                    break
+                tags.extend(resp.json().get("tags") or [])
+                url = _parse_link_next(resp.headers.get("Link", ""))
+            return tags
+
+        # ── Pass 1: start from current_tag as cursor (fast path) ──────────
+        # Strip leading v/V so the cursor lands at the right alphabetic spot
+        cursor = current_tag.lstrip("vV")
+        # Re-add v prefix if the tag uses it (keeps cursor consistent with tags)
+        if current_tag.startswith(("v", "V")):
+            cursor = "v" + cursor
+        cursor_url = (f"https://ghcr.io/v2/{image_path}/tags/list"
+                      f"?n=200&last={cursor}")
+        all_tags = _fetch_pages(cursor_url, max_pages=3)
+        result   = _find_newest_tag(all_tags, current_tag)
+
+        if result:
+            log.info("GHCR registry API (cursor) found %s for %s (current: %s)",
+                     result, image_path, current_tag)
+            return result
+
+        # ── Pass 2: fallback forward scan from start ───────────────────────
+        log.debug("GHCR cursor pass found nothing for %s — trying forward scan",
+                  image_path)
+        all_tags = _fetch_pages(
+            f"https://ghcr.io/v2/{image_path}/tags/list?n=1000",
+            max_pages=5
+        )
         result = _find_newest_tag(all_tags, current_tag)
         if result:
-            log.info("GHCR registry API found %s for %s (current: %s)",
+            log.info("GHCR registry API (forward) found %s for %s (current: %s)",
                      result, image_path, current_tag)
         return result
+
     except Exception as exc:
         log.error("_query_ghcr_registry_api %s/%s: %s", org, repo, exc)
         return None
