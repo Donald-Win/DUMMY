@@ -1323,16 +1323,26 @@ def update_service(container: str, new_tag: str, job_id: str = None, history_sta
             if not write_env_var(var, new_tag):
                 return {"success": False, "error": f"Failed to write {var} to {ENV_FILE} — check DUMMY logs for details (common cause: volume mounted :ro)"}
 
-            # Recreate the container with the new image rather than just
-            # restarting — restart keeps the old image baked into the
-            # container spec and the new tag is never actually used.
-            jl(f"Recreating container with {image}:{new_tag}...")
+            # Find all OTHER monitored containers that share the same env var
+            # (e.g. immich_server and immich_machine_learning both use IMMICH_VER)
+            # so they can be updated in the same operation.
+            all_monitored = get_monitored_containers()
+            peers = [
+                c for c in all_monitored
+                if c["container"] != container
+                and c["_strategy_cfg"].get("env_var") == var
+            ]
+            if peers:
+                peer_names = [p["container"] for p in peers]
+                jl(f"Found {len(peers)} peer container(s) sharing {var}: {', '.join(peer_names)}")
+
+            # Recreate primary container
+            jl(f"Recreating {container} with {image}:{new_tag}...")
             ok, err = recreate_container(
                 client, container_obj, f"{image}:{new_tag}",
                 jlog=lambda m: jl(m)
             )
             if not ok:
-                # Recreate failed — restore .env to old tag
                 write_env_var(var, current_tag)
                 return {"success": False, "error": err}
 
@@ -1352,10 +1362,41 @@ def update_service(container: str, new_tag: str, job_id: str = None, history_sta
 
             add_to_history(container, new_tag, status=history_status)
             clear_available_update(container)
+
+            # Recreate peer containers sharing the same env var
+            peer_failures = []
+            for peer in peers:
+                peer_name  = peer["container"]
+                peer_image = peer["image"]
+                jl(f"Recreating peer {peer_name} with {peer_image}:{new_tag}...")
+                try:
+                    peer_obj = client.containers.get(peer_name)
+                    add_to_history(peer_name, peer["current_tag"], status="previous")
+                    p_ok, p_err = recreate_container(
+                        client, peer_obj, f"{peer_image}:{new_tag}",
+                        jlog=lambda m: jl(m)
+                    )
+                    if p_ok and check_container_health(peer_name, jlog=jl):
+                        add_to_history(peer_name, new_tag, status=history_status)
+                        clear_available_update(peer_name)
+                        jl(f"Peer {peer_name} updated ✓")
+                    else:
+                        jl(f"Peer {peer_name} failed: {p_err}", "warn")
+                        peer_failures.append(peer_name)
+                except Exception as exc:
+                    jl(f"Peer {peer_name} error: {exc}", "warn")
+                    peer_failures.append(peer_name)
+
+            all_updated = [container] + [p["container"] for p in peers if p["container"] not in peer_failures]
+            summary = f"Updated to {new_tag}" + (f" ({len(all_updated)} containers)" if peers else "")
+            if peer_failures:
+                summary += f" — peer failures: {', '.join(peer_failures)}"
+
             jl(f"Done! {current_tag} → {new_tag}")
             notify(f"Updated: {container}", f"{container}: {current_tag} → {new_tag}", tags="white_check_mark")
-            send_webhook("update_success", {"container": container, "from_tag": current_tag, "to_tag": new_tag, "status": history_status})
-            return {"success": True, "message": f"Updated to {new_tag}"}
+            send_webhook("update_success", {"container": container, "from_tag": current_tag, "to_tag": new_tag,
+                         "status": history_status, "peers_updated": all_updated})
+            return {"success": True, "message": summary}
 
         # ── COMPOSE FILE ──────────────────────────────────────────────────
         elif strategy == STRATEGY_COMPOSE:
