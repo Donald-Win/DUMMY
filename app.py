@@ -190,6 +190,13 @@ _ARCH_KEYWORDS = [
     "arm64v8", "amd64", "armhf", "arm32v7", "i386", "ppc64le",
     "s390x", "linux-", "-arm64", "-armv7", "-armv6", "-aarch64",
 ]
+# Hardware/runtime variant suffixes — these are specialised builds of the
+# same release, not newer versions. e.g. v2.7.4-openvino, v2.7.4-cuda,
+# v2.7.4-rocm. Filter them so the plain release tag is always preferred.
+_VARIANT_KEYWORDS = [
+    "-openvino", "-cuda", "-rocm", "-tensorrt", "-gpu",
+    "-cpu", "-onnx", "-mlkit", "-coreml",
+]
 
 # Tags must look like a version to be considered.
 # Accepts: 1.2.3  v1.2.3  V1.2.3  version-1.2.3  1.2.3-4  1.43.0.10492-abc07
@@ -210,6 +217,10 @@ def is_stable_tag(tag: str) -> bool:
     if re.search(r"-ls\d+", tl):
         return False
     if re.search(r"-lt\d+-", tl):
+        return False
+    # Reject hardware/runtime variant tags (e.g. v2.7.4-openvino, v2.7.4-cuda)
+    # These are specialised builds, not newer releases.
+    if any(kw in tl for kw in _VARIANT_KEYWORDS):
         return False
     # Must look like a version number — rejects 'latest', 'main', 'pr-1633', etc.
     if not _VERSION_RE.match(tag):
@@ -1384,7 +1395,8 @@ def update_service(container: str, new_tag: str, job_id: str = None, history_sta
                         jl(f"Peer {peer_name} failed: {p_err}", "warn")
                         peer_failures.append(peer_name)
                 except Exception as exc:
-                    jl(f"Peer {peer_name} error: {exc}", "warn")
+                    jl(f"Peer {peer_name} error: {exc}", "error")
+                    log.error("peer update %s: %s", peer_name, exc, exc_info=True)
                     peer_failures.append(peer_name)
 
             all_updated = [container] + [p["container"] for p in peers if p["container"] not in peer_failures]
