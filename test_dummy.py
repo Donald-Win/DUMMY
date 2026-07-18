@@ -7,6 +7,9 @@ Covers: tag filtering, version comparison, registry URL routing, webhook,
 import sys
 import types
 import unittest
+import tempfile
+import shutil
+import sqlite3
 from unittest.mock import MagicMock, patch
 
 # ---------------------------------------------------------------------------
@@ -355,6 +358,346 @@ class TestDismiss(unittest.TestCase):
         conn, cur = self._mock_conn(fetchone_val=None)
         with patch.object(dummy, "_get_conn", return_value=conn):
             self.assertFalse(dummy.is_dismissed("radarr", "v7.0.0"))
+
+
+# ===========================================================================
+# recreate_container: config preservation helpers
+# ===========================================================================
+class TestConvertHealthcheck(unittest.TestCase):
+
+    def test_none_returns_none(self):
+        self.assertIsNone(dummy._convert_healthcheck(None))
+
+    def test_empty_dict_returns_none(self):
+        self.assertIsNone(dummy._convert_healthcheck({}))
+
+    def test_no_test_key_returns_none(self):
+        # Docker sets Config.Healthcheck to {} when the image has none,
+        # but some engine versions include a dict with an empty Test.
+        self.assertIsNone(dummy._convert_healthcheck({"Test": []}))
+
+    def test_converts_capitalized_to_snake_case(self):
+        raw = {
+            "Test": ["CMD", "curl", "-f", "http://localhost:8191/docs"],
+            "Interval": 30_000_000_000,
+            "Timeout": 10_000_000_000,
+            "Retries": 3,
+            "StartPeriod": 30_000_000_000,
+        }
+        result = dummy._convert_healthcheck(raw)
+        self.assertEqual(result["test"], raw["Test"])
+        self.assertEqual(result["interval"], 30_000_000_000)
+        self.assertEqual(result["timeout"], 10_000_000_000)
+        self.assertEqual(result["retries"], 3)
+        self.assertEqual(result["start_period"], 30_000_000_000)
+
+    def test_missing_optional_fields_default_to_zero(self):
+        result = dummy._convert_healthcheck({"Test": ["NONE"]})
+        self.assertEqual(result["interval"], 0)
+        self.assertEqual(result["timeout"], 0)
+        self.assertEqual(result["retries"], 0)
+        self.assertEqual(result["start_period"], 0)
+
+
+class TestConvertUlimits(unittest.TestCase):
+
+    def test_none_returns_none(self):
+        self.assertIsNone(dummy._convert_ulimits(None))
+
+    def test_empty_list_returns_none(self):
+        self.assertIsNone(dummy._convert_ulimits([]))
+
+    def test_converts_raw_dicts_to_ulimit_objects(self):
+        # Stub docker.types.Ulimit since the `docker` module itself is
+        # stubbed out for these tests (see module setup above).
+        fake_ulimit_cls = MagicMock(side_effect=lambda name, soft, hard: {"name": name, "soft": soft, "hard": hard})
+        fake_types = types.SimpleNamespace(Ulimit=fake_ulimit_cls)
+        with patch.object(dummy.dockerlib, "types", fake_types, create=True):
+            raw = [{"Name": "nofile", "Soft": 1024, "Hard": 2048}]
+            result = dummy._convert_ulimits(raw)
+        self.assertEqual(len(result), 1)
+        fake_ulimit_cls.assert_called_once_with(name="nofile", soft=1024, hard=2048)
+
+    def test_malformed_entry_is_skipped_not_fatal(self):
+        fake_ulimit_cls = MagicMock(side_effect=lambda name, soft, hard: object())
+        fake_types = types.SimpleNamespace(Ulimit=fake_ulimit_cls)
+        with patch.object(dummy.dockerlib, "types", fake_types, create=True):
+            raw = [{"Name": "nofile"}]  # missing Soft/Hard -> KeyError, should be skipped
+            result = dummy._convert_ulimits(raw)
+        self.assertIsNone(result)
+
+
+class TestRecreateContainerStopTimeout(unittest.TestCase):
+    """
+    Verifies recreate_container reads HostConfig.StopTimeout (compose's
+    stop_grace_period) instead of always hardcoding 30s.
+    """
+
+    def _make_container(self, stop_timeout=None, tmpfs=None):
+        c = MagicMock()
+        c.name = "qbittorrent"
+        c.attrs = {
+            "HostConfig": {
+                "NetworkMode": "host",
+                "Binds": [],
+                **({"StopTimeout": stop_timeout} if stop_timeout is not None else {}),
+                **({"Tmpfs": tmpfs} if tmpfs is not None else {}),
+            },
+            "NetworkSettings": {"Networks": {}},
+            "Config": {"Env": [], "Labels": {}},
+        }
+        return c
+
+    def test_uses_configured_stop_timeout(self):
+        client = MagicMock()
+        container = self._make_container(stop_timeout=1800, tmpfs={"/tmp": ""})
+        client.containers.create.return_value = MagicMock()
+        ok, err = dummy.recreate_container(client, container, "qbittorrentofficial/qbittorrent-nox:5.2.4-1")
+        self.assertTrue(ok, err)
+        container.stop.assert_called_once_with(timeout=1800)
+        create_kwargs = client.containers.create.call_args.kwargs
+        self.assertEqual(create_kwargs.get("stop_timeout"), 1800)
+        self.assertEqual(create_kwargs.get("tmpfs"), {"/tmp": ""})
+
+    def test_falls_back_to_30s_when_unset(self):
+        client = MagicMock()
+        container = self._make_container(stop_timeout=None)
+        client.containers.create.return_value = MagicMock()
+        ok, err = dummy.recreate_container(client, container, "someimage:latest")
+        self.assertTrue(ok, err)
+        container.stop.assert_called_once_with(timeout=30)
+
+
+# ===========================================================================
+# Constant-time auth comparison
+# ===========================================================================
+class TestDbBackup(unittest.TestCase):
+    """Scheduled SQLite backups via the online backup API + pruning/listing."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmpdir, "versions.db")
+        self.backup_dir = os.path.join(self.tmpdir, "backups")
+        self._patches = [
+            patch.object(dummy, "DB_PATH", self.db_path),
+            patch.object(dummy, "DB_BACKUP_DIR", self.backup_dir),
+            patch.object(dummy, "DB_BACKUP_KEEP", 3),
+        ]
+        for p in self._patches:
+            p.start()
+        dummy.init_db()
+        dummy.add_to_history("plex", "1.43.3.10828-00f62d37d", status="deployed")
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_backup_creates_file_with_matching_data(self):
+        path = dummy.backup_db()
+        self.assertIsNotNone(path)
+        self.assertTrue(os.path.exists(path))
+
+        # The backup should be a fully independent, queryable SQLite DB
+        # with the same data as the live one at backup time.
+        conn = sqlite3.connect(path)
+        rows = conn.execute("SELECT container, tag, status FROM version_history").fetchall()
+        conn.close()
+        self.assertIn(("plex", "1.43.3.10828-00f62d37d", "deployed"), rows)
+
+    def test_backup_survives_missing_db_gracefully(self):
+        os.remove(self.db_path)
+        # sqlite3.connect() on a missing path just creates an empty DB file,
+        # so this should still succeed rather than raise.
+        path = dummy.backup_db()
+        self.assertIsNotNone(path)
+
+    def test_prune_keeps_only_most_recent_n(self):
+        os.makedirs(self.backup_dir, exist_ok=True)
+        # Create 5 fake backup files with distinct sortable names
+        for i in range(5):
+            open(os.path.join(self.backup_dir, f"versions-2026070{i}-000000.db"), "w").close()
+
+        dummy._prune_old_backups()
+
+        remaining = sorted(os.listdir(self.backup_dir))
+        self.assertEqual(len(remaining), 3)
+        # Should have kept the lexicographically-latest (most recent) three
+        self.assertEqual(remaining, [
+            "versions-20260702-000000.db",
+            "versions-20260703-000000.db",
+            "versions-20260704-000000.db",
+        ])
+
+    def test_list_db_backups_reports_size_and_time(self):
+        dummy.backup_db()
+        dummy.backup_db()
+        backups = dummy.list_db_backups()
+        self.assertEqual(len(backups), 2)
+        for b in backups:
+            self.assertIn("filename", b)
+            self.assertIn("size_kb", b)
+            self.assertIn("created_at", b)
+            self.assertGreater(b["size_kb"], 0)
+
+    def test_list_db_backups_empty_when_no_dir(self):
+        self.assertEqual(dummy.list_db_backups(), [])
+
+    def test_backup_never_raises_on_unwritable_dir(self):
+        with patch.object(dummy, "DB_BACKUP_DIR", "/nonexistent/root/path/nope"), \
+             patch("os.makedirs", side_effect=PermissionError("nope")):
+            result = dummy.backup_db()
+        self.assertIsNone(result)
+
+
+class TestJobTracking(unittest.TestCase):
+    """Crash-safe job tracking: active_jobs table read/write + startup check."""
+
+    def _mock_conn(self, fetchall_val=None):
+        conn = MagicMock()
+        cur = MagicMock()
+        cur.fetchall.return_value = fetchall_val or []
+        conn.cursor.return_value = cur
+        return conn, cur
+
+    def test_job_begin_writes_row(self):
+        conn, cur = self._mock_conn()
+        with patch.object(dummy, "_get_conn", return_value=conn):
+            dummy._job_begin("plex", "job-1", "env_file", "1.43.2", "1.43.3")
+        sql, params = cur.execute.call_args[0]
+        self.assertIn("INSERT OR REPLACE INTO active_jobs", sql)
+        self.assertEqual(params[0], "plex")
+        self.assertEqual(params[3], "1.43.2")
+        self.assertEqual(params[4], "1.43.3")
+        self.assertEqual(params[5], "started")
+        conn.commit.assert_called_once()
+
+    def test_job_step_updates_step_column(self):
+        conn, cur = self._mock_conn()
+        with patch.object(dummy, "_get_conn", return_value=conn):
+            dummy._job_step("plex", "recreated")
+        sql, params = cur.execute.call_args[0]
+        self.assertIn("UPDATE active_jobs SET step=?", sql)
+        self.assertEqual(params, ("recreated", "plex"))
+
+    def test_job_end_deletes_row(self):
+        conn, cur = self._mock_conn()
+        with patch.object(dummy, "_get_conn", return_value=conn):
+            dummy._job_end("plex")
+        sql, params = cur.execute.call_args[0]
+        self.assertIn("DELETE FROM active_jobs WHERE container=?", sql)
+        self.assertEqual(params, ("plex",))
+
+    def test_job_helpers_never_raise_on_db_error(self):
+        with patch.object(dummy, "_get_conn", side_effect=Exception("db locked")):
+            # None of these should propagate — a DB hiccup shouldn't break an update
+            dummy._job_begin("plex", "job-1", "env_file", "a", "b")
+            dummy._job_step("plex", "recreated")
+            dummy._job_end("plex")
+
+    def test_check_interrupted_jobs_noop_when_no_rows(self):
+        conn, cur = self._mock_conn(fetchall_val=[])
+        with patch.object(dummy, "_get_conn", return_value=conn), \
+             patch.object(dummy, "notify") as mock_notify:
+            dummy.check_for_interrupted_jobs()
+        mock_notify.assert_not_called()
+        # SELECT happened but no DELETE (nothing to clear)
+        executed_sql = [c[0][0] for c in cur.execute.call_args_list]
+        self.assertFalse(any("DELETE FROM active_jobs" in s for s in executed_sql))
+
+    def test_check_interrupted_jobs_warns_notifies_and_clears(self):
+        stale_row = ("plex", "job-1", "env_file", "1.43.2.10687", "1.43.3.10828", "env_written", "2026-07-18T00:00:00")
+        conn, cur = self._mock_conn(fetchall_val=[stale_row])
+        with patch.object(dummy, "_get_conn", return_value=conn), \
+             patch.object(dummy, "notify") as mock_notify, \
+             patch.object(dummy.log, "warning") as mock_warn:
+            dummy.check_for_interrupted_jobs()
+
+        # Warned about it
+        self.assertTrue(mock_warn.called)
+        # Notified via ntfy so it's not buried in logs only
+        mock_notify.assert_called_once()
+        notify_args = mock_notify.call_args[0]
+        self.assertIn("plex", notify_args[0])
+        # Cleared the stale marker so it doesn't re-alert every restart
+        executed_sql = [c[0][0] for c in cur.execute.call_args_list]
+        self.assertTrue(any("DELETE FROM active_jobs" in s for s in executed_sql))
+        conn.commit.assert_called()
+
+
+class TestEnvFileCurrentTagUsesLiveContainer(unittest.TestCase):
+    """
+    Regression test: 'Current' for env_file-strategy containers must reflect
+    the actual running container's image tag, not a possibly-stale .env
+    value (which can drift if an update/rollback job is interrupted).
+    """
+
+    def _make_plex_container(self, running_tag):
+        c = MagicMock()
+        c.name = "plex"
+        c.image.tags = [f"plexinc/pms-docker:{running_tag}"]
+        c.attrs = {
+            "Config": {"Labels": {"dummy.enable": "true", "dummy.env_var": "PLEX_VER"}},
+        }
+        return c
+
+    def test_current_tag_matches_live_container_not_stale_env(self):
+        container = self._make_plex_container("1.43.3.10828-00f62d37d")
+        fake_client = MagicMock()
+        fake_client.containers.list.return_value = [container]
+
+        with patch.object(dummy, "get_docker_client", return_value=fake_client), \
+             patch.object(dummy, "read_env_cached", return_value={"PLEX_VER": "1.43.2.10687-563d026ea"}), \
+             patch.object(dummy, "_fetch_container_data_bulk", return_value={
+                 "plex": {"available_tag": None, "checked_at": "", "history": [], "dismissed": [], "dismissed_tags": set()}
+             }):
+            items = dummy.get_monitored_containers()
+
+        self.assertEqual(len(items), 1)
+        # Must show the live container tag (1.43.3), not the stale .env value (1.43.2)
+        self.assertEqual(items[0]["current_tag"], "1.43.3.10828-00f62d37d")
+
+    def test_no_drift_no_warning_needed(self):
+        container = self._make_plex_container("1.43.3.10828-00f62d37d")
+        fake_client = MagicMock()
+        fake_client.containers.list.return_value = [container]
+
+        with patch.object(dummy, "get_docker_client", return_value=fake_client), \
+             patch.object(dummy, "read_env_cached", return_value={"PLEX_VER": "1.43.3.10828-00f62d37d"}), \
+             patch.object(dummy, "_fetch_container_data_bulk", return_value={
+                 "plex": {"available_tag": None, "checked_at": "", "history": [], "dismissed": [], "dismissed_tags": set()}
+             }), \
+             patch.object(dummy.log, "warning") as mock_warn:
+            items = dummy.get_monitored_containers()
+
+        self.assertEqual(items[0]["current_tag"], "1.43.3.10828-00f62d37d")
+        mock_warn.assert_not_called()
+
+
+class TestValidCreds(unittest.TestCase):
+
+    def test_correct_credentials_pass(self):
+        with patch.object(dummy, "BASIC_AUTH_USER", "ducky"), \
+             patch.object(dummy, "BASIC_AUTH_PASS", "hunter2"):
+            self.assertTrue(dummy._valid_creds("ducky", "hunter2"))
+
+    def test_wrong_password_fails(self):
+        with patch.object(dummy, "BASIC_AUTH_USER", "ducky"), \
+             patch.object(dummy, "BASIC_AUTH_PASS", "hunter2"):
+            self.assertFalse(dummy._valid_creds("ducky", "wrong"))
+
+    def test_wrong_username_fails(self):
+        with patch.object(dummy, "BASIC_AUTH_USER", "ducky"), \
+             patch.object(dummy, "BASIC_AUTH_PASS", "hunter2"):
+            self.assertFalse(dummy._valid_creds("nope", "hunter2"))
+
+    def test_uses_compare_digest_not_equality(self):
+        # Ensures we didn't accidentally revert to the timing-unsafe `==`
+        with patch.object(dummy, "BASIC_AUTH_USER", "ducky"), \
+             patch.object(dummy, "BASIC_AUTH_PASS", "hunter2"), \
+             patch.object(dummy._hmac, "compare_digest", wraps=dummy._hmac.compare_digest) as mock_cd:
+            dummy._valid_creds("ducky", "hunter2")
+            self.assertTrue(mock_cd.called)
 
 
 if __name__ == "__main__":

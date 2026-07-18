@@ -9,10 +9,6 @@ DUMMY is a self-hosted web UI that monitors your Docker containers, alerts you w
 
 ---
 
-![DUMMY screenshot showing dashboard with stat cards and container list](.github/screenshot.png)
-
----
-
 ## What it does
 
 - Polls Docker Hub and GHCR for newer image versions on a schedule, with retry and rate-limit handling
@@ -24,6 +20,8 @@ DUMMY is a self-hosted web UI that monitors your Docker containers, alerts you w
 - Pins containers you want to monitor but never auto-update
 - Sends push notifications via ntfy and outbound webhooks on every event
 - Supports basic auth to protect the UI from other users on your network
+- Detects and alerts on updates interrupted by a crash or forced restart, instead of silently drifting
+- Backs up its own database on a schedule using SQLite's online backup API
 
 ---
 
@@ -41,7 +39,7 @@ services:
       - "5000:5000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock   # required — Docker access
-      - /opt/stacks/dummy:/data                      # required — persistent history
+      - /opt/stacks/dummy:/data                      # required — persistent history + backups
     environment:
       TZ: Pacific/Auckland
     networks:
@@ -74,7 +72,7 @@ DUMMY picks a strategy automatically based on which labels are present. You can 
 
 ### Strategy 1 — Docker API (default)
 
-No extra labels needed. DUMMY recreates the container via the Docker SDK, preserving all volumes, ports, networks, environment variables, restart policies, and capabilities.
+No extra labels needed. DUMMY recreates the container via the Docker SDK, preserving volumes, ports, networks, environment variables, restart policies, capabilities, `tmpfs` mounts, DNS settings, sysctls, security options, ulimits, the configured stop grace period, and any compose-level `healthcheck:` override.
 
 ```yaml
 services:
@@ -111,7 +109,7 @@ Add to DUMMY's volumes:
 
 ### Strategy 3 — Env file
 
-DUMMY updates a version variable in your `.env` file and restarts the container. Best when you pin versions as variables and reference them like `image: radarr:${RADARR_VER}`.
+DUMMY updates a version variable in your `.env` file and recreates the container directly via the Docker API — the running container is always the source of truth. Best when you pin versions as variables and reference them like `image: radarr:${RADARR_VER}`.
 
 ```yaml
 services:
@@ -126,6 +124,8 @@ Add to DUMMY's volumes:
 ```yaml
 - /path/to/your/.env:/env/.env
 ```
+
+> ℹ️ The dashboard's "Current" value for these containers is always read from the live container, not from `.env` text. If a `.env` value ever drifts out of sync with what's actually running (e.g. an update was interrupted — see [Stability & recovery](#stability--recovery) below), DUMMY logs a warning rather than displaying a stale number.
 
 ---
 
@@ -155,7 +155,7 @@ services:
       - "5000:5000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - /opt/stacks/dummy:/data
+      - /opt/stacks/dummy:/data                                        # history + backups
       - /opt/stacks/.env:/env/.env                                    # Strategy 3
       - /opt/stacks/docker-compose.yml:/compose/docker-compose.yml    # Strategy 2
     environment:
@@ -164,8 +164,9 @@ services:
       NTFY_TOPIC: DockerUpdate
       NTFY_CLICK_URL: http://update.yourdomain.com
       WEBHOOK_URL: http://homeassistant:8123/api/webhook/dummy         # optional
-      BASIC_AUTH_USER: admin                                           # optional
-      BASIC_AUTH_PASS: changeme                                        # optional
+      BASIC_AUTH_USER: admin                                           # optional but recommended
+      BASIC_AUTH_PASS: changeme                                        # optional but recommended
+      DB_BACKUP_KEEP: 7                                                # optional, default shown
     networks:
       - internal
 
@@ -259,6 +260,16 @@ curl -X POST http://your-server:5000/api/undismiss \
 
 ---
 
+## Stability & recovery
+
+Update operations are multi-step (edit `.env`/compose → recreate container → wait for health check). If DUMMY's own process dies partway through — a crash, a forced restart, an OOM kill, a power cut — that's no longer a silent failure mode:
+
+- **Crash-safe job tracking.** Before each update/rollback, DUMMY records which container it's touching, the strategy, the from/to tags, and a checkpoint of how far it got. On the next startup, if that record is still there, DUMMY logs a clear warning (and sends an ntfy alert) telling you exactly where the interruption happened, instead of leaving a container and its `.env`/compose file silently out of sync.
+- **Live container is always the source of truth.** For env-file and compose-file strategies, the dashboard's "Current" value is read from the actual running container — never trusted blindly from a text file that could have drifted.
+- **Scheduled database backups.** `versions.db` (your update history, dismissed updates, and settings) is snapshotted on a schedule using SQLite's online backup API — safe to run against a live database, unlike copying the raw file. Backups live in `/data/backups`, inside the same bind mount you're already required to have, so a stack-wide backup tool (e.g. `restic`) picks them up automatically. Old backups are pruned automatically.
+
+---
+
 ## Environment variables
 
 ### Security
@@ -266,7 +277,9 @@ curl -X POST http://your-server:5000/api/undismiss \
 | Variable | Default | Description |
 |---|---|---|
 | `BASIC_AUTH_USER` | — | Username for basic auth. Leave unset to disable authentication. |
-| `BASIC_AUTH_PASS` | — | Password for basic auth. Set both user and pass to enable. The `/health` endpoint is always unauthenticated for Docker's own health check. |
+| `BASIC_AUTH_PASS` | — | Password for basic auth. Set both user and pass to enable. Credentials are compared in constant time. The `/health` endpoint is always unauthenticated for Docker's own health check. |
+
+DUMMY has access to your Docker socket. If it's reachable by anything other than you, setting `BASIC_AUTH_USER`/`BASIC_AUTH_PASS` is strongly recommended.
 
 ### Paths and ports
 
@@ -275,6 +288,15 @@ curl -X POST http://your-server:5000/api/undismiss \
 | `DB_PATH` | `/data/versions.db` | SQLite database path. Always mount `/data` to a host directory. |
 | `ENV_FILE_PATH` | `/env/.env` | Your `.env` file inside the container (Strategy 3). |
 | `PORT` | `5000` | Port Flask listens on. |
+
+### Database backups
+
+| Variable | Default | Description |
+|---|---|---|
+| `DB_BACKUP_ENABLED` | `true` | Enable scheduled backups of `versions.db`. |
+| `DB_BACKUP_DIR` | `<DB_PATH dir>/backups` | Where backups are written. Defaults to a `backups` subfolder next to your DB, inside the same bind mount. |
+| `DB_BACKUP_INTERVAL_HOURS` | `24` | Hours between automatic backups. A backup also runs once at startup. |
+| `DB_BACKUP_KEEP` | `7` | Number of most-recent backups to retain; older ones are pruned automatically. |
 
 ### Notifications (ntfy)
 
@@ -339,7 +361,7 @@ These set the initial defaults. The Settings panel takes precedence once saved.
 | Mount | When needed | Description |
 |---|---|---|
 | `/var/run/docker.sock` | Always | Docker socket. Required for container inspection and management. |
-| `/data` | **Always** | Persistent SQLite database for version history, update cache, dismissed updates, and settings. Without this, all state is lost on restart. DUMMY warns in the UI if this is not a bind mount. |
+| `/data` | **Always** | Persistent SQLite database for version history, update cache, dismissed updates, and settings, plus scheduled backups under `/data/backups`. Without this, all state is lost on restart. DUMMY warns in the UI if this is not a bind mount. |
 | `/env/.env` | Strategy 3 | The `.env` file DUMMY will read and edit. |
 | `/compose/docker-compose.yml` | Strategy 2 | The compose file DUMMY will read and edit. |
 
@@ -350,14 +372,15 @@ These set the initial defaults. The Settings panel takes precedence once saved.
 When you click **Update** (or DUMMY applies one automatically):
 
 1. Checks no other update is already running on that container
-2. Pulls the new image
-3. Stops and removes the old container
-4. Recreates it with identical config — volumes, ports, networks, env vars, restart policy, capabilities
-5. Waits up to `HEALTH_CHECK_TIMEOUT` seconds for the container to become healthy
-6. If the health check fails → reverts to the previous image, restarts, notifies, and fires the `update_failed` webhook
-7. If it passes → records the new version in history, notifies, and fires the `update_success` webhook
+2. Records an in-progress job marker (container, strategy, from/to tags) so an interrupted update can be detected on next startup
+3. Pulls the new image
+4. Stops and removes the old container, respecting its configured stop grace period
+5. Recreates it with identical config — volumes, ports, networks, env vars, restart policy, capabilities, `tmpfs`, DNS, sysctls, security options, ulimits, and any healthcheck override
+6. Waits up to `HEALTH_CHECK_TIMEOUT` seconds for the container to become healthy
+7. If the health check fails → reverts to the previous image, restarts, notifies, and fires the `update_failed` webhook
+8. If it passes → records the new version in history, notifies, fires the `update_success` webhook, and clears the in-progress job marker
 
-File writes (`.env`, compose YAML) are atomic — DUMMY writes to a `.tmp` file then renames, so a power failure mid-write never corrupts your files.
+File writes (`.env`, compose YAML) are atomic — DUMMY writes to a `.tmp` file then renames, so a power failure mid-write never corrupts your files. See [Stability & recovery](#stability--recovery) for what happens if DUMMY itself is interrupted mid-update.
 
 ---
 
@@ -380,6 +403,22 @@ curl -X POST http://your-server:5000/api/history/import \
 ```
 
 Re-importing is safe — duplicate entries are skipped automatically.
+
+### Restoring from a database backup
+
+If `versions.db` is ever lost or corrupted, restore the most recent snapshot from `/data/backups`:
+
+```bash
+# Stop DUMMY first
+docker stop dummy
+
+# Copy the most recent backup over the live DB
+cp /opt/stacks/dummy/backups/versions-<latest-timestamp>.db /opt/stacks/dummy/versions.db
+
+docker start dummy
+```
+
+This only restores DUMMY's own history/settings — it has no effect on your actual containers, which are unaffected either way.
 
 ---
 
@@ -427,6 +466,8 @@ All update, rollback, and check operations return a `job_id` immediately and run
 | `GET` | `/api/history/export` | Download full version history as `dummy-history.json` |
 | `POST` | `/api/history/import` | Restore from a previously exported file |
 | `GET` | `/api/history/<container>` | Version history for one container |
+| `GET` | `/api/backups` | List database backups with size and timestamp |
+| `POST` | `/api/backups/run` | Trigger a database backup immediately |
 
 ---
 
@@ -436,11 +477,10 @@ All update, rollback, and check operations return a `job_id` immediately and run
 python3 -m unittest test_dummy -v
 ```
 
-No extra dependencies needed — the test suite stubs out Docker, Flask, and requests and runs with the standard library only. Tests cover tag filtering, version comparison, registry routing, changelog URL generation, retry logic, webhook behaviour, and the dismiss system.
+No extra dependencies needed — the test suite stubs out Docker, Flask, and requests and runs with the standard library only. Tests cover tag filtering, version comparison, registry routing, changelog URL generation, retry logic, webhook behaviour, the dismiss system, container-recreate config preservation, constant-time auth, env-file drift detection, crash-safe job tracking, and scheduled database backups.
 
 ---
 
 ## License
 
 MIT
-
