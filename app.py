@@ -1299,7 +1299,20 @@ def get_monitored_containers() -> list:
             pinned       = dummy_labels.get("pin", "").lower() == "true"
 
             if strategy == STRATEGY_ENV_FILE:
-                current_tag = env_vars.get(strategy_cfg["env_var"], tag)
+                # The running container is the real source of truth — Docker API
+                # recreate never reads .env, so .env can drift from what's
+                # actually deployed (e.g. an update/rollback job interrupted
+                # mid-flight). Use the live container tag for display, and just
+                # log if .env disagrees so drift doesn't go unnoticed.
+                current_tag = tag
+                env_tag = env_vars.get(strategy_cfg["env_var"])
+                if env_tag and env_tag != tag:
+                    log.warning(
+                        "%s: .env %s=%s does not match running container tag %s "
+                        "(likely an interrupted update/rollback) — using the "
+                        "container's live tag for display",
+                        c.name, strategy_cfg["env_var"], env_tag, tag
+                    )
             elif strategy == STRATEGY_COMPOSE:
                 current_tag = get_compose_image_tag(strategy_cfg["compose_file"], strategy_cfg["compose_svc"]) or tag
             else:
