@@ -2410,4 +2410,596 @@ async function fetchStatus(){
     if(d.active_updates) {
       document.querySelectorAll('.card[id^="card-"]').forEach(card => {
         const name = card.id.replace('card-', '');
-        const isActive = d.active_updates.includ
+        const isActive = d.active_updates.includes(name);
+        card.classList.toggle('updating', isActive);
+        const badge = card.querySelector('.b-updating');
+        if(isActive && !badge){
+          const b = document.createElement('span');
+          b.className = 'badge b-updating';
+          b.textContent = '⟳ UPDATING';
+          const badges = card.querySelector('.badges');
+          if(badges) badges.appendChild(b);
+        } else if(!isActive && badge){
+          badge.remove();
+        }
+      });
+    }
+  } catch(e){}
+}
+
+function tickCountdown(){
+  const el = document.getElementById('next-check');
+  if(!el) return;
+  if(!_nextCheckTs){ el.textContent = '—'; return; }
+  const ms = _nextCheckTs - Date.now();
+  if(ms <= 0){ el.textContent = 'Soon...'; return; }
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  const s = Math.floor((ms % 60000) / 1000);
+  el.textContent = h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${s}s` : `${s}s`;
+}
+
+function ago(ts){
+  const ms = Date.now() - ts;
+  const m = Math.floor(ms / 60000);
+  const h = Math.floor(m / 60);
+  if(h > 0) return `${h}h ${m % 60}m ago`;
+  if(m > 0) return `${m}m ago`;
+  return 'Just now';
+}
+
+// ── Settings ────────────────────────────────────────────────────────────────
+function openSettings(){
+  // Load current values from API then show modal
+  fetch('/api/settings').then(r=>r.json()).then(cfg => {
+    const sel = document.getElementById('cfg-interval');
+    if(sel){
+      // Select closest matching option
+      const opts = [...sel.options].map(o=>parseInt(o.value));
+      const ci = cfg.check_interval;
+      sel.value = opts.reduce((a,b) => Math.abs(b-ci) < Math.abs(a-ci) ? b : a);
+    }
+    const sh = document.getElementById('cfg-history');
+    if(sh) sh.value = cfg.history_limit;
+    setToggle('cfg-prerelease', 'cfg-prerelease-lbl', cfg.allow_prerelease);
+    setToggle('cfg-autoupdate', 'cfg-autoupdate-lbl', cfg.auto_update);
+    document.getElementById('settings-saved').classList.remove('show');
+    document.getElementById('settings-overlay').classList.add('visible');
+  }).catch(()=>{
+    document.getElementById('settings-overlay').classList.add('visible');
+  });
+}
+
+function closeSettings(){
+  document.getElementById('settings-overlay').classList.remove('visible');
+}
+
+function setToggle(id, lblId, val){
+  const cb = document.getElementById(id);
+  const lbl = document.getElementById(lblId);
+  if(cb) cb.checked = !!val;
+  if(lbl) lbl.textContent = val ? 'On' : 'Off';
+}
+
+// Update label text when toggle is clicked
+['cfg-prerelease','cfg-autoupdate'].forEach(id => {
+  document.addEventListener('DOMContentLoaded', () => {
+    const cb = document.getElementById(id);
+    if(cb) cb.addEventListener('change', () => {
+      const lbl = document.getElementById(id+'-lbl');
+      if(lbl) lbl.textContent = cb.checked ? 'On' : 'Off';
+    });
+  });
+});
+
+async function saveSettings(){
+  const payload = {
+    check_interval:   parseInt(document.getElementById('cfg-interval').value),
+    history_limit:    parseInt(document.getElementById('cfg-history').value),
+    allow_prerelease: document.getElementById('cfg-prerelease').checked,
+    auto_update:      document.getElementById('cfg-autoupdate').checked,
+  };
+  try {
+    const r = await fetch('/api/settings', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const d = await r.json();
+    if(d.success){
+      const saved = document.getElementById('settings-saved');
+      saved.classList.add('show');
+      setTimeout(() => { saved.classList.remove('show'); }, 2500);
+      // Reload after short delay so dashboard reflects new settings
+      setTimeout(() => { closeSettings(); location.reload(); }, 1200);
+    }
+  } catch(e){ alert('Save failed: ' + e.message); }
+}
+
+// Close settings on overlay click
+document.getElementById('settings-overlay').addEventListener('click', function(e){
+  if(e.target === this) closeSettings();
+});
+
+// ── Check Now ───────────────────────────────────────────────────────────────
+async function checkNow(){
+  const btn = document.getElementById('btn-check');
+  const icon = document.getElementById('check-icon');
+  btn.disabled = true;
+  icon.innerHTML = '<div class="spinner" style="width:14px;height:14px;display:inline-block"></div>';
+
+  openModal('Checking for updates...');
+
+  try {
+    const r = await fetch('/api/check', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
+      body: JSON.stringify({}),
+    });
+    // Guard against non-JSON responses (e.g. Caddy redirect → 405 HTML page)
+    const ct = r.headers.get('Content-Type') || '';
+    if (!ct.includes('application/json')) {
+      const text = await r.text();
+      const hint = r.status === 405 ? ' (HTTP 405 — possible proxy redirect issue)' :
+                   r.status === 301 || r.status === 302 ? ' (redirect — check proxy config)' : '';
+      throw new Error(`Server returned HTTP ${r.status}${hint}`);
+    }
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    const jobId = d.job_id;
+    if(jobId){
+      const result = await pollJob(jobId);
+      modalDone(true, result && result.message ? result.message : 'Check complete');
+    } else {
+      // No job id returned — shouldn't happen but fail gracefully
+      throw new Error('No job ID returned from server');
+    }
+  } catch(e){
+    appendLog('Error: ' + e.message, 'error');
+    modalDone(false, 'Check failed: ' + e.message);
+  }
+
+  btn.disabled = false;
+  icon.textContent = '\u21BB';
+  fetchStatus();
+}
+
+// ── Update ──────────────────────────────────────────────────────────────────
+async function doUpdate(container, tag){
+  openModal(`Updating ${container} \u2192 ${tag}`);
+  try {
+    const r = await fetch('/api/update', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({container, tag})
+    });
+    const d = await r.json();
+    if(d.job_id){
+      const result = await pollJob(d.job_id);
+      if(result && result.success){
+        modalDone(true, result.message || 'Update complete', true);
+      } else {
+        modalDone(false, result ? result.error : 'Unknown error');
+      }
+    }
+  } catch(e){
+    modalDone(false, 'Network error: ' + e.message);
+  }
+}
+
+// ── Rollback ────────────────────────────────────────────────────────────────
+async function rollbackTo(container, tag){
+  if(!confirm(`Restore ${container} to ${tag}?`)) return;
+  openModal(`Restoring ${container} \u2192 ${tag}`);
+  try {
+    const r = await fetch('/api/rollback', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({container, tag})
+    });
+    const d = await r.json();
+    if(d.job_id){
+      const result = await pollJob(d.job_id);
+      if(result && result.success){
+        modalDone(true, result.message || 'Rollback complete', true);
+      } else {
+        modalDone(false, result ? result.error : 'Unknown error');
+      }
+    }
+  } catch(e){
+    modalDone(false, 'Network error: ' + e.message);
+  }
+}
+
+// ── Job polling ─────────────────────────────────────────────────────────────
+let _lastLogCount = 0;
+
+async function pollJob(jobId){
+  _lastLogCount = 0;
+  return new Promise(resolve => {
+    const iv = setInterval(async () => {
+      try {
+        const r = await fetch('/api/jobs/' + jobId);
+        const d = await r.json();
+
+        // Append any new log lines
+        const newLines = d.log.slice(_lastLogCount);
+        newLines.forEach(l => appendLog(l.msg, l.lvl));
+        _lastLogCount = d.log.length;
+
+        if(d.done){
+          clearInterval(iv);
+          resolve(d);
+        }
+      } catch(e){
+        clearInterval(iv);
+        resolve(null);
+      }
+    }, 800);
+  });
+}
+
+// ── Modal ────────────────────────────────────────────────────────────────────
+function openModal(title){
+  document.getElementById('modal-title').textContent = title;
+  document.getElementById('modal-icon').innerHTML = '<div class="spinner"></div>';
+  document.getElementById('modal-log').innerHTML = '';
+  const close = document.getElementById('modal-close');
+  close.disabled = true;
+  close.textContent = 'Close';
+  close.className = 'btn btn-ghost';
+  close.onclick = () => closeModal(false);
+  document.getElementById('overlay').classList.add('visible');
+  _lastLogCount = 0;
+}
+
+function appendLog(msg, level){
+  const log = document.getElementById('modal-log');
+  const line = document.createElement('div');
+  line.className = 'log-line';
+  const now = new Date();
+  const t = [now.getHours(), now.getMinutes(), now.getSeconds()]
+    .map(n => String(n).padStart(2,'0')).join(':');
+  line.innerHTML = `<span class="log-t">${t}</span><span class="log-msg ${level||''}">${escHtml(msg)}</span>`;
+  log.appendChild(line);
+  log.scrollTop = log.scrollHeight;
+}
+
+function modalDone(success, msg, reload=false){
+  document.getElementById('modal-icon').textContent = success ? '\u2705' : '\u274C';
+  if(msg) appendLog(msg, success ? 'info' : 'error');
+  const close = document.getElementById('modal-close');
+  close.disabled = false;
+  close.textContent = (success && reload) ? 'Close & Refresh' : 'Close';
+  if(success && reload){
+    close.className = 'btn btn-primary';
+    close.onclick = () => closeModal(true);
+  } else {
+    close.className = 'btn btn-ghost';
+    close.onclick = () => closeModal(false);
+  }
+}
+
+function closeModal(forceReload){
+  document.getElementById('overlay').classList.remove('visible');
+  if(forceReload) location.reload();
+}
+
+// Close modal on overlay click
+document.getElementById('overlay').addEventListener('click', function(e){
+  if(e.target === this && !document.getElementById('modal-close').disabled){
+    closeModal();
+  }
+});
+
+function escHtml(s){
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Filter / search ─────────────────────────────────────────────────────────
+let _filterUpdatesOnly = false;
+
+function filterCards(){
+  const q = (document.getElementById('filter-input').value || '').toLowerCase();
+  document.querySelectorAll('.card[id^="card-"]').forEach(card => {
+    const name = card.id.replace('card-', '').toLowerCase();
+    const hasUpdate = card.classList.contains('has-update');
+    const matchText = !q || name.includes(q);
+    const matchFilter = !_filterUpdatesOnly || hasUpdate;
+    card.classList.toggle('hidden', !matchText || !matchFilter);
+  });
+}
+
+function toggleFilterUpdates(){
+  _filterUpdatesOnly = !_filterUpdatesOnly;
+  const btn = document.getElementById('btn-filter-updates');
+  if(btn) btn.classList.toggle('active', _filterUpdatesOnly);
+  filterCards();
+}
+
+// ── Dismiss ──────────────────────────────────────────────────────────────────
+async function dismissUpdate(container, tag){
+  if(!confirm(`Dismiss update to ${tag} for ${container}?
+
+It won't appear again until a newer version is found.`)) return;
+  try {
+    await fetch('/api/dismiss', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({container, tag})
+    });
+    location.reload();
+  } catch(e) {
+    alert('Dismiss failed: ' + e.message);
+  }
+}
+
+// ── Init ─────────────────────────────────────────────────────────────────────
+initTheme();
+initStatus();
+</script>
+</body>
+</html>"""
+
+
+# ---------------------------------------------------------------------------
+# Flask routes
+# ---------------------------------------------------------------------------
+
+@app.route("/")
+def index():
+    containers    = get_monitored_containers()
+    updates_count = sum(1 for c in containers if c["has_update"])
+    running_count = sum(1 for c in containers if c["status"] == "running")
+    cfg = get_all_settings()
+    ci  = cfg["check_interval"]
+    interval_h = f"{ci // 3600}h" if ci >= 3600 else f"{ci // 60}m"
+    for c in containers:
+        c.pop("_strategy_cfg", None)
+    return render_template_string(
+        HTML,
+        containers       = containers,
+        updates_count    = updates_count,
+        running_count    = running_count,
+        title            = WEB_TITLE,
+        check_interval_h = interval_h,
+        allow_prerelease = cfg["allow_prerelease"],
+        auto_update      = cfg["auto_update"],
+        ntfy_enabled     = bool(NTFY_ENDPOINT),
+        history_limit    = cfg["history_limit"],
+        persistent       = _check_persistence(),
+    )
+
+
+@app.route("/api/status")
+def api_status():
+    cfg = get_all_settings()
+    with _active_lock:
+        active = list(_active_containers)
+    return jsonify({
+        "last_check_time": _last_check_time,
+        "next_check_time": _next_check_time,
+        "check_interval":  cfg["check_interval"],
+        "check_running":   _check_running.is_set(),
+        "active_updates":  active,
+    })
+
+
+@app.route("/api/settings", methods=["GET"])
+def api_settings_get():
+    return jsonify(get_all_settings())
+
+
+@app.route("/api/settings", methods=["POST"])
+def api_settings_post():
+    data = request.json or {}
+    allowed = {"check_interval", "allow_prerelease", "auto_update", "history_limit"}
+    saved = {}
+    errors = {}
+    for key, value in data.items():
+        if key not in allowed:
+            errors[key] = "Unknown setting"
+            continue
+        try:
+            if key == "check_interval":
+                v = int(value)
+                if v < 60 or v > 86400:
+                    errors[key] = "Must be between 60 and 86400 seconds"
+                    continue
+                save_setting(key, str(v))
+                saved[key] = v
+            elif key == "history_limit":
+                v = int(value)
+                if v < 1 or v > 50:
+                    errors[key] = "Must be between 1 and 50"
+                    continue
+                save_setting(key, str(v))
+                saved[key] = v
+            elif key in ("allow_prerelease", "auto_update"):
+                v = "true" if str(value).lower() in ("true", "1", "yes") else "false"
+                save_setting(key, v)
+                saved[key] = v == "true"
+        except Exception as exc:
+            errors[key] = str(exc)
+    log.info("Settings updated: %s", saved)
+    return jsonify({"success": True, "saved": saved, "errors": errors})
+
+
+@app.route("/api/jobs/<job_id>")
+def api_job(job_id):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    return jsonify({
+        "done":    job["done"],
+        "success": job["success"],
+        "error":   job["error"],
+        "message": job["message"],
+        "log":     job["log"],
+    })
+
+
+@app.route("/api/update", methods=["POST"])
+def api_update():
+    data = request.json or {}
+    container, tag = data.get("container"), data.get("tag")
+    if not container or not tag:
+        return jsonify({"success": False, "error": "Missing parameters"})
+
+    job_id = _new_job()
+
+    def run():
+        result = update_service(container, tag, job_id=job_id)
+        _job_done(job_id, result.get("success", False),
+                  message=result.get("message",""),
+                  error=result.get("error",""))
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/api/rollback", methods=["POST"])
+def api_rollback():
+    data = request.json or {}
+    container  = data.get("container")
+    target_tag = data.get("tag")
+    if not container:
+        return jsonify({"success": False, "error": "Missing container"})
+
+    job_id = _new_job()
+
+    def run():
+        result = rollback_service(container, target_tag, job_id=job_id)
+        _job_done(job_id, result.get("success", False),
+                  message=result.get("message",""),
+                  error=result.get("error",""))
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/api/check", methods=["POST"])
+def api_check():
+    if _check_running.is_set():
+        if time.time() - _check_started_at > 900:
+            log.warning("check_running flag stuck for >15min — force-clearing")
+            _check_running.clear()
+        else:
+            return jsonify({"success": False, "error": "A check is already in progress — try again shortly"}), 429
+
+    data      = request.json or {}
+    target    = data.get("container")   # optional: check just one container
+    job_id    = _new_job()
+
+    def run():
+        _check_once(job_id=job_id, target_container=target)
+        _job_done(job_id, True, message="Check complete")
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"success": True, "job_id": job_id})
+
+
+@app.route("/api/containers")
+def api_containers():
+    items = get_monitored_containers()
+    for c in items:
+        c.pop("_strategy_cfg", None)
+    return jsonify(items)
+
+
+@app.route("/api/history/export")
+def api_history_export():
+    try:
+        conn = _get_conn()
+        c = conn.cursor()
+        c.execute("SELECT container, tag, deployed_at, status FROM version_history ORDER BY deployed_at ASC")
+        rows = c.fetchall()
+        conn.close()
+        data = [{"container": r[0], "tag": r[1], "deployed_at": r[2], "status": r[3]} for r in rows]
+        return Response(
+            json.dumps({"exported_at": datetime.now().isoformat(), "history": data}, indent=2),
+            mimetype="application/json",
+            headers={"Content-Disposition": "attachment; filename=dummy-history.json"}
+        )
+    except Exception as exc:
+        log.error("api_history_export: %s", exc)
+        return jsonify({"success": False, "error": str(exc)})
+
+
+@app.route("/api/history/import", methods=["POST"])
+def api_history_import():
+    try:
+        data = request.json or {}
+        rows = data.get("history", [])
+        if not rows:
+            return jsonify({"success": False, "error": "No history entries in payload"})
+        conn = _get_conn()
+        c = conn.cursor()
+        inserted = skipped = 0
+        for row in rows:
+            try:
+                c.execute(
+                    """INSERT INTO version_history (container, tag, deployed_at, status)
+                       SELECT ?,?,?,? WHERE NOT EXISTS (
+                           SELECT 1 FROM version_history WHERE container=? AND deployed_at=?)""",
+                    (row["container"], row["tag"], row["deployed_at"], row["status"],
+                     row["container"], row["deployed_at"])
+                )
+                if c.rowcount: inserted += 1
+                else: skipped += 1
+            except Exception:
+                skipped += 1
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True, "inserted": inserted, "skipped": skipped})
+    except Exception as exc:
+        log.error("api_history_import: %s", exc)
+        return jsonify({"success": False, "error": str(exc)})
+
+
+@app.route("/api/history/<container>")
+def api_container_history(container):
+    return jsonify(get_history(container))
+
+
+@app.route("/api/dismiss", methods=["POST"])
+def api_dismiss():
+    data      = request.json or {}
+    container = data.get("container")
+    tag       = data.get("tag")
+    if not container or not tag:
+        return jsonify({"success": False, "error": "Missing container or tag"})
+    dismiss_update(container, tag)
+    return jsonify({"success": True})
+
+
+@app.route("/api/undismiss", methods=["POST"])
+def api_undismiss():
+    data      = request.json or {}
+    container = data.get("container")
+    tag       = data.get("tag")
+    if not container:
+        return jsonify({"success": False, "error": "Missing container"})
+    undismiss_update(container, tag)
+    return jsonify({"success": True})
+
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "containers_monitored": len(get_monitored_containers())})
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    log.info("=== DUMMY - Docker Update Made Manageable, Yay! ===")
+    log.info("Allow prerelease: %s | Auto-update: %s | Check interval: %ds",
+             ALLOW_PRERELEASE, AUTO_UPDATE, CHECK_INTERVAL)
+    init_db()
+    _next_check_time = time.time() + CHECK_INTERVAL
+    threading.Thread(target=check_for_updates, daemon=True).start()
+    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
