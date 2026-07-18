@@ -52,6 +52,17 @@ ALLOW_PRERELEASE = os.environ.get("ALLOW_PRERELEASE", "false").lower() == "true"
 AUTO_UPDATE      = os.environ.get("AUTO_UPDATE", "false").lower() == "true"
 WEB_TITLE        = os.environ.get("WEB_TITLE", "DUMMY")
 
+# --- Database backups ---
+# versions.db holds all update history / dismissed updates / settings.
+# Backups are written into the same bind-mounted /data volume (alongside the
+# live DB), one directory over, so a stack-wide backup tool (e.g. restic
+# pointed at /stacks/data/dummy) picks them up for free.
+DB_BACKUP_ENABLED  = os.environ.get("DB_BACKUP_ENABLED", "true").lower() == "true"
+DB_BACKUP_DIR      = os.environ.get("DB_BACKUP_DIR", os.path.join(os.path.dirname(
+                          os.environ.get("DB_PATH", "/data/versions.db")), "backups"))
+DB_BACKUP_INTERVAL = int(os.environ.get("DB_BACKUP_INTERVAL_HOURS", "24")) * 3600
+DB_BACKUP_KEEP     = int(os.environ.get("DB_BACKUP_KEEP", "7"))
+
 NTFY_ENDPOINT    = os.environ.get("NTFY_ENDPOINT", "").rstrip("/")
 NTFY_TOPIC       = os.environ.get("NTFY_TOPIC", "DockerUpdate")
 NTFY_TOKEN       = os.environ.get("NTFY_TOKEN", "")
@@ -512,7 +523,7 @@ def get_changelog(image: str, label_override: str = None):
 # ---------------------------------------------------------------------------
 
 # Current schema version — increment when adding migrations below
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 # Each entry is (version, sql) — run in order when upgrading
 _MIGRATIONS = [
@@ -525,6 +536,9 @@ _MIGRATIONS = [
     (2, """CREATE TABLE IF NOT EXISTS dismissed_updates (
                container TEXT, tag TEXT, dismissed_at TEXT,
                PRIMARY KEY (container, tag))"""),
+    (3, """CREATE TABLE IF NOT EXISTS active_jobs (
+               container TEXT PRIMARY KEY, job_id TEXT, strategy TEXT,
+               from_tag TEXT, to_tag TEXT, step TEXT, started_at TEXT)"""),
 ]
 
 
@@ -569,6 +583,88 @@ def init_db():
     log.info("DB schema up to date (v%d)", _SCHEMA_VERSION)
 
 
+# ---------------------------------------------------------------------------
+# Database backups
+# ---------------------------------------------------------------------------
+
+def backup_db() -> str | None:
+    """
+    Snapshot versions.db using SQLite's online backup API — safe to run
+    against a live WAL-mode DB (unlike copying the raw file, which can grab
+    an inconsistent mid-write state). Returns the backup path on success.
+    """
+    try:
+        os.makedirs(DB_BACKUP_DIR, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        dest_path = os.path.join(DB_BACKUP_DIR, f"versions-{stamp}.db")
+
+        src = sqlite3.connect(DB_PATH)
+        dest = sqlite3.connect(dest_path)
+        with dest:
+            src.backup(dest)
+        dest.close()
+        src.close()
+
+        size_kb = os.path.getsize(dest_path) / 1024
+        log.info("DB backup written: %s (%.1f KB)", dest_path, size_kb)
+        _prune_old_backups()
+        return dest_path
+    except Exception as exc:
+        log.error("backup_db: %s", exc)
+        return None
+
+
+def _prune_old_backups():
+    """Keep only the DB_BACKUP_KEEP most recent backups."""
+    try:
+        if not os.path.isdir(DB_BACKUP_DIR):
+            return
+        backups = sorted(
+            (f for f in os.listdir(DB_BACKUP_DIR) if f.startswith("versions-") and f.endswith(".db")),
+            reverse=True,
+        )
+        for stale in backups[DB_BACKUP_KEEP:]:
+            try:
+                os.remove(os.path.join(DB_BACKUP_DIR, stale))
+                log.debug("Pruned old DB backup: %s", stale)
+            except OSError as exc:
+                log.warning("Could not prune backup %s: %s", stale, exc)
+    except Exception as exc:
+        log.error("_prune_old_backups: %s", exc)
+
+
+def list_db_backups() -> list:
+    """Return backup filenames (newest first) with size and mtime, for the UI."""
+    try:
+        if not os.path.isdir(DB_BACKUP_DIR):
+            return []
+        out = []
+        for f in os.listdir(DB_BACKUP_DIR):
+            if f.startswith("versions-") and f.endswith(".db"):
+                full = os.path.join(DB_BACKUP_DIR, f)
+                out.append({
+                    "filename": f,
+                    "size_kb": round(os.path.getsize(full) / 1024, 1),
+                    "created_at": datetime.fromtimestamp(os.path.getmtime(full)).isoformat(),
+                })
+        return sorted(out, key=lambda b: b["created_at"], reverse=True)
+    except Exception as exc:
+        log.error("list_db_backups: %s", exc)
+        return []
+
+
+def run_db_backups():
+    """Background loop: back up the DB on startup, then every DB_BACKUP_INTERVAL."""
+    if not DB_BACKUP_ENABLED:
+        log.info("DB backups disabled (DB_BACKUP_ENABLED=false)")
+        return
+    log.info("DB backups enabled — every %dh, keeping last %d, dir=%s",
+              DB_BACKUP_INTERVAL // 3600, DB_BACKUP_KEEP, DB_BACKUP_DIR)
+    while True:
+        backup_db()
+        time.sleep(DB_BACKUP_INTERVAL)
+
+
 def add_to_history(container: str, tag: str, status: str = "deployed"):
     try:
         limit = get_all_settings()["history_limit"]
@@ -583,6 +679,105 @@ def add_to_history(container: str, tag: str, status: str = "deployed"):
         conn.close()
     except Exception as exc:
         log.error("add_to_history: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Crash-safe job tracking
+#
+# update_service() is multi-step (write .env/compose -> recreate container ->
+# health check). If the DUMMY process dies mid-update (crash, forced restart,
+# OOM, power loss), those steps can be left half-done with no record of it —
+# e.g. .env gets reverted to an old tag but the container never gets
+# recreated to match. That's not hypothetical: it happened to a Plex
+# rollback that got interrupted by an unrelated container restart.
+#
+# We persist a row for the duration of each update/rollback. A row that's
+# still there on the NEXT startup means the previous run never finished
+# cleanly, and we can't trust .env/compose to match the real container.
+# ---------------------------------------------------------------------------
+
+def _job_begin(container: str, job_id: str, strategy: str, from_tag: str, to_tag: str):
+    try:
+        conn = _get_conn()
+        c = conn.cursor()
+        c.execute("""INSERT OR REPLACE INTO active_jobs
+                     (container, job_id, strategy, from_tag, to_tag, step, started_at)
+                     VALUES (?,?,?,?,?,?,?)""",
+                  (container, job_id, strategy, from_tag, to_tag, "started",
+                   datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        log.error("_job_begin %s: %s", container, exc)
+
+
+def _job_step(container: str, step: str):
+    """Checkpoint progress so a startup reconciliation can pinpoint where an
+    interrupted job died (e.g. 'env_written' vs 'recreated' vs 'healthy')."""
+    try:
+        conn = _get_conn()
+        c = conn.cursor()
+        c.execute("UPDATE active_jobs SET step=? WHERE container=?", (step, container))
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        log.error("_job_step %s: %s", container, exc)
+
+
+def _job_end(container: str):
+    """Clear the in-progress marker. Called on every resolved outcome
+    (success, handled failure + rollback) — NOT called on process death,
+    which is exactly what leaves a row behind for startup to find."""
+    try:
+        conn = _get_conn()
+        c = conn.cursor()
+        c.execute("DELETE FROM active_jobs WHERE container=?", (container,))
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        log.error("_job_end %s: %s", container, exc)
+
+
+def check_for_interrupted_jobs():
+    """
+    Run once at startup. Any row still in active_jobs means the last update
+    never completed cleanly. We can't safely auto-resolve which of
+    .env/compose vs the real container is correct, so we surface it loudly
+    (log + ntfy) rather than let it drift unnoticed, then clear the marker
+    so it doesn't re-alert on every subsequent restart.
+    """
+    try:
+        conn = _get_conn()
+        c = conn.cursor()
+        c.execute("SELECT container, job_id, strategy, from_tag, to_tag, step, started_at FROM active_jobs")
+        rows = c.fetchall()
+        if rows:
+            for container, job_id, strategy, from_tag, to_tag, step, started_at in rows:
+                log.warning("=" * 60)
+                log.warning("INTERRUPTED UPDATE DETECTED: %s", container)
+                log.warning(
+                    "  %s -> %s (strategy=%s) was interrupted at step '%s' "
+                    "(started %s) and never completed cleanly — likely a "
+                    "crash or forced restart mid-update.",
+                    from_tag, to_tag, strategy, step, started_at
+                )
+                log.warning(
+                    "  Verify %s's actual running image/tag manually before "
+                    "trusting the dashboard or .env/compose file for it.",
+                    container
+                )
+                log.warning("=" * 60)
+                notify(
+                    f"Interrupted update: {container}",
+                    f"{from_tag} → {to_tag} was interrupted at '{step}' — verify the "
+                    f"running container manually before trusting the dashboard.",
+                    priority="4", tags="warning",
+                )
+            c.execute("DELETE FROM active_jobs")
+            conn.commit()
+        conn.close()
+    except Exception as exc:
+        log.error("check_for_interrupted_jobs: %s", exc)
 
 
 def get_history(container: str) -> list:
@@ -1389,10 +1584,12 @@ def update_service(container: str, new_tag: str, job_id: str = None, history_sta
             current_tag = read_env().get(var, "unknown")
             jl(f"Current:    {current_tag}  ({var})")
             add_to_history(container, current_tag, status="previous")
+            _job_begin(container, job_id or "auto", strategy, current_tag, new_tag)
 
             jl(f"Writing {var}={new_tag} to .env...")
             if not write_env_var(var, new_tag):
                 return {"success": False, "error": f"Failed to write {var} to {ENV_FILE} — check DUMMY logs for details (common cause: volume mounted :ro)"}
+            _job_step(container, "env_written")
 
             # Find all OTHER monitored containers that share the same env var
             # (e.g. immich_server and immich_machine_learning both use IMMICH_VER)
@@ -1416,6 +1613,7 @@ def update_service(container: str, new_tag: str, job_id: str = None, history_sta
             if not ok:
                 write_env_var(var, current_tag)
                 return {"success": False, "error": err}
+            _job_step(container, "recreated")
 
             if not check_container_health(container, jlog=jl):
                 jl(f"Rolling back — restoring {var}={current_tag}", "warn")
@@ -1431,6 +1629,7 @@ def update_service(container: str, new_tag: str, job_id: str = None, history_sta
                 send_webhook("update_failed", {"container": container, "attempted_tag": new_tag, "rolled_back_to": current_tag})
                 return {"success": False, "error": "Health check failed — auto-rolled back"}
 
+            _job_step(container, "healthy")
             add_to_history(container, new_tag, status=history_status)
             clear_available_update(container)
 
@@ -1477,6 +1676,7 @@ def update_service(container: str, new_tag: str, job_id: str = None, history_sta
             current_tag  = get_compose_image_tag(compose_file, compose_svc) or "unknown"
             jl(f"Current:    {current_tag}")
             add_to_history(container, current_tag, status="previous")
+            _job_begin(container, job_id or "auto", strategy, current_tag, new_tag)
 
             # Snapshot the original lines before touching the file so we
             # can reliably restore even if the rollback file-edit also fails.
@@ -1490,6 +1690,7 @@ def update_service(container: str, new_tag: str, job_id: str = None, history_sta
             ok, old_tag = set_compose_image_tag(compose_file, compose_svc, new_tag)
             if not ok:
                 return {"success": False, "error": f"Failed to edit {compose_file}"}
+            _job_step(container, "compose_edited")
 
             jl(f"Running: docker compose up -d {compose_svc}")
             ok, err = run_compose_up(compose_file, compose_svc)
@@ -1501,6 +1702,7 @@ def update_service(container: str, new_tag: str, job_id: str = None, history_sta
                 except Exception:
                     pass
                 return {"success": False, "error": f"docker compose up failed: {err}"}
+            _job_step(container, "compose_up")
 
             if not check_container_health(container, jlog=jl):
                 jl("Rolling back compose file from snapshot...", "warn")
@@ -1513,6 +1715,7 @@ def update_service(container: str, new_tag: str, job_id: str = None, history_sta
                 notify(f"Update Failed: {container}", f"Rolled back to {old_tag}", priority="4", tags="warning")
                 send_webhook("update_failed", {"container": container, "attempted_tag": new_tag, "rolled_back_to": old_tag})
                 return {"success": False, "error": "Health check failed — auto-rolled back"}
+            _job_step(container, "healthy")
 
             add_to_history(container, new_tag, status=history_status)
             clear_available_update(container)
@@ -1526,11 +1729,13 @@ def update_service(container: str, new_tag: str, job_id: str = None, history_sta
             _, current_tag = get_image_parts(container_obj)
             jl(f"Current:    {current_tag}")
             add_to_history(container, current_tag, status="previous")
+            _job_begin(container, job_id or "auto", strategy, current_tag, new_tag)
 
             ok, err = recreate_container(client, container_obj, f"{image}:{new_tag}",
                                          jlog=lambda m: jl(m))
             if not ok:
                 return {"success": False, "error": err}
+            _job_step(container, "recreated")
 
             if not check_container_health(container, jlog=jl):
                 jl("Rolling back to previous image...", "warn")
@@ -1543,6 +1748,7 @@ def update_service(container: str, new_tag: str, job_id: str = None, history_sta
                 notify(f"Update Failed: {container}", f"Rolled back to {current_tag}", priority="4", tags="warning")
                 send_webhook("update_failed", {"container": container, "attempted_tag": new_tag, "rolled_back_to": current_tag})
                 return {"success": False, "error": "Health check failed — auto-rolled back"}
+            _job_step(container, "healthy")
 
             add_to_history(container, new_tag, status=history_status)
             clear_available_update(container)
@@ -1555,6 +1761,11 @@ def update_service(container: str, new_tag: str, job_id: str = None, history_sta
         log.error("update_service %s: %s", container, exc)
         return {"success": False, "error": str(exc)}
     finally:
+        # Cleared on every path Python actually executes (success, handled
+        # failure, or a caught exception). If the row is still there on
+        # next startup, the process itself died mid-update — see
+        # check_for_interrupted_jobs().
+        _job_end(container)
         with _active_lock:
             _active_containers.discard(container)
 
@@ -3005,6 +3216,25 @@ def health():
     return jsonify({"status": "ok", "containers_monitored": len(get_monitored_containers())})
 
 
+@app.route("/api/backups")
+def api_backups():
+    return jsonify({
+        "success": True,
+        "enabled": DB_BACKUP_ENABLED,
+        "interval_hours": DB_BACKUP_INTERVAL // 3600,
+        "keep": DB_BACKUP_KEEP,
+        "backups": list_db_backups(),
+    })
+
+
+@app.route("/api/backups/run", methods=["POST"])
+def api_backups_run():
+    path = backup_db()
+    if not path:
+        return jsonify({"success": False, "error": "Backup failed — check DUMMY logs"})
+    return jsonify({"success": True, "path": path})
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -3013,6 +3243,8 @@ if __name__ == "__main__":
     log.info("Allow prerelease: %s | Auto-update: %s | Check interval: %ds",
              ALLOW_PRERELEASE, AUTO_UPDATE, CHECK_INTERVAL)
     init_db()
+    check_for_interrupted_jobs()
     _next_check_time = time.time() + CHECK_INTERVAL
     threading.Thread(target=check_for_updates, daemon=True).start()
+    threading.Thread(target=run_db_backups, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
