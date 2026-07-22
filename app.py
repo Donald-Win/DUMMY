@@ -1264,8 +1264,27 @@ def recreate_container(client, container_obj, new_image: str, jlog=None):
         "security_opt":   host_cfg.get("SecurityOpt") or [],
         "ulimits":        _convert_ulimits(host_cfg.get("Ulimits")),
         "stop_signal":    cfg.get("StopSignal"),
-        "stop_timeout":   stop_timeout,
         "healthcheck":    _convert_healthcheck(cfg.get("Healthcheck")),
+        # NOTE: intentionally NOT setting "stop_timeout" here. docker-py's
+        # high-level containers.create() does not support it — it's a
+        # long-standing, unresolved upstream limitation (docker/docker-py#3168),
+        # confirmed the hard way (this crashed ntfy's recreate in production).
+        # The low-level client.api.create_container() does accept it, but
+        # switching this whole function to the low-level API risks subtly
+        # breaking port bindings / healthcheck formatting in ways that can't
+        # be verified without a live daemon, so it's not worth the risk here.
+        #
+        # Practical effect: `stop_timeout` (below) is still fully honored for
+        # every stop DUMMY itself performs (see container_obj.stop() call),
+        # which is what actually protects a slow-shutdown container like
+        # qBittorrent during a DUMMY-driven update. What's NOT preserved is
+        # the value baked into the new container's own Docker config, so a
+        # `docker stop`/`docker compose down` run by something other than
+        # DUMMY will fall back to Docker's default (10s) after a DUMMY
+        # recreate. If a container needs stop_grace_period honored outside
+        # of DUMMY too, use the compose-file strategy for it instead —
+        # `docker compose up` sets this correctly because it talks to Docker
+        # directly, not through this code path.
     }
     create_kwargs = {k: v for k, v in create_kwargs.items() if v is not None and v != {} and v != []}
 
