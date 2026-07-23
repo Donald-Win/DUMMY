@@ -1865,6 +1865,15 @@ def _check_one_container(item: dict, cfg: dict, job_id: str = None) -> tuple:
             _jlog(job_id, f"  → {latest} available but dismissed")
         else:
             _jlog(job_id, f"  → Up to date")
+            # Genuinely up to date — clear any stale available_updates row.
+            # Without this, a row saved by an earlier check (back when this
+            # container really was behind) lingers forever once current_tag
+            # catches up through any path other than a normal DUMMY-driven
+            # update (e.g. a manual update, or the Plex .env-drift incident
+            # where the live container advanced without update_service ever
+            # running clear_available_update). Otherwise "Available" keeps
+            # showing a value identical to "Current" indefinitely.
+            clear_available_update(container)
         return None
 
 
