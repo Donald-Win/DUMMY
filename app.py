@@ -3,11 +3,17 @@ DUMMY - Docker Update Made Manageable, Yay!
 
 Three update strategies, auto-detected from Docker labels:
 
-  1. docker_api  - pull + recreate via Docker SDK. Just add dummy.enable=true.
+  1. docker_api  - pull + replace via Docker SDK. Just add dummy.enable=true.
   2. compose     - edit the compose YAML + docker compose up -d.
                    Add dummy.enable=true + dummy.compose_file=/path/to/compose.yaml
-  3. env_file    - update a .env variable + restart.
+  3. env_file    - update a .env variable + replace the container.
                    Add dummy.enable=true + dummy.env_var=MY_VAR_NAME
+
+Safety model for docker_api and env_file replacements:
+  The running container is stopped and RENAMED (not removed). The new container
+  is created, started and health-checked. Only after it passes is the old one
+  removed. On failure the new one is discarded and the old one is renamed back
+  and restarted, so no image pull is needed to roll back.
 """
 
 import os
@@ -15,14 +21,19 @@ import re
 import time
 import uuid
 import json
+import hmac
+import base64
 import logging
 import sqlite3
 import subprocess
 import threading
+import contextlib
 from datetime import datetime
+from functools import wraps
 
 import yaml
-from flask import Flask, render_template_string, request, jsonify, Response
+from flask import Flask, render_template_string, request, jsonify, Response, abort
+from werkzeug.exceptions import HTTPException
 import docker as dockerlib
 import requests as req
 
@@ -42,37 +53,36 @@ if LOG_LEVEL != "DEBUG":
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-ENV_FILE         = os.environ.get("ENV_FILE_PATH", "/env/.env")
-DB_PATH          = os.environ.get("DB_PATH", "/data/versions.db")
-PORT             = int(os.environ.get("PORT", "5000"))
-CHECK_INTERVAL   = int(os.environ.get("CHECK_INTERVAL", "21600"))
-HEALTH_TIMEOUT   = int(os.environ.get("HEALTH_CHECK_TIMEOUT", "60"))
-HISTORY_LIMIT    = int(os.environ.get("HISTORY_LIMIT", "5"))
-ALLOW_PRERELEASE = os.environ.get("ALLOW_PRERELEASE", "false").lower() == "true"
-AUTO_UPDATE      = os.environ.get("AUTO_UPDATE", "false").lower() == "true"
-WEB_TITLE        = os.environ.get("WEB_TITLE", "DUMMY")
+ENV_FILE             = os.environ.get("ENV_FILE_PATH", "/env/.env")
+DB_PATH              = os.environ.get("DB_PATH", "/data/versions.db")
+PORT                 = int(os.environ.get("PORT", "5000"))
+CHECK_INTERVAL       = int(os.environ.get("CHECK_INTERVAL", "21600"))
+HEALTH_TIMEOUT       = int(os.environ.get("HEALTH_CHECK_TIMEOUT", "120"))
+STABLE_SECONDS       = int(os.environ.get("STABLE_SECONDS", "15"))   # no-healthcheck containers
+HISTORY_LIMIT        = int(os.environ.get("HISTORY_LIMIT", "5"))
+ALLOW_PRERELEASE     = os.environ.get("ALLOW_PRERELEASE", "false").lower() == "true"
+AUTO_UPDATE          = os.environ.get("AUTO_UPDATE", "false").lower() == "true"
+WEB_TITLE            = os.environ.get("WEB_TITLE", "DUMMY")
 
-# --- Database backups ---
-# versions.db holds all update history / dismissed updates / settings.
-# Backups are written into the same bind-mounted /data volume (alongside the
-# live DB), one directory over, so a stack-wide backup tool (e.g. restic
-# pointed at /stacks/data/dummy) picks them up for free.
-DB_BACKUP_ENABLED  = os.environ.get("DB_BACKUP_ENABLED", "true").lower() == "true"
-DB_BACKUP_DIR      = os.environ.get("DB_BACKUP_DIR", os.path.join(os.path.dirname(
-                          os.environ.get("DB_PATH", "/data/versions.db")), "backups"))
-DB_BACKUP_INTERVAL = int(os.environ.get("DB_BACKUP_INTERVAL_HOURS", "24")) * 3600
-DB_BACKUP_KEEP     = int(os.environ.get("DB_BACKUP_KEEP", "7"))
+NTFY_ENDPOINT        = os.environ.get("NTFY_ENDPOINT", "").rstrip("/")
+NTFY_TOPIC           = os.environ.get("NTFY_TOPIC", "DockerUpdate")
+NTFY_TOKEN           = os.environ.get("NTFY_TOKEN", "")
+NTFY_CLICK_URL       = os.environ.get("NTFY_CLICK_URL", "")
 
-NTFY_ENDPOINT    = os.environ.get("NTFY_ENDPOINT", "").rstrip("/")
-NTFY_TOPIC       = os.environ.get("NTFY_TOPIC", "DockerUpdate")
-NTFY_TOKEN       = os.environ.get("NTFY_TOKEN", "")
-NTFY_CLICK_URL   = os.environ.get("NTFY_CLICK_URL", "")
+GITHUB_TOKEN         = os.environ.get("GITHUB_TOKEN", "")
 
-GITHUB_TOKEN     = os.environ.get("GITHUB_TOKEN", "")
+BASIC_AUTH_USER      = os.environ.get("BASIC_AUTH_USER", "")
+BASIC_AUTH_PASS      = os.environ.get("BASIC_AUTH_PASS", "")
+WEBHOOK_URL          = os.environ.get("WEBHOOK_URL", "").strip()
 
-BASIC_AUTH_USER  = os.environ.get("BASIC_AUTH_USER", "")
-BASIC_AUTH_PASS  = os.environ.get("BASIC_AUTH_PASS", "")
-WEBHOOK_URL      = os.environ.get("WEBHOOK_URL", "").strip()
+DEFAULT_STOP_TIMEOUT = 10
+BACKUP_SUFFIX        = "-dummy-old"
+
+# Input validation. Anything that reaches .env, compose files, or docker pull
+# must pass these, so a crafted request cannot inject extra lines or images.
+TAG_RE      = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+NAME_RE     = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$")
+ENV_VAR_RE  = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # Backward-compat: VERSION_VARS => env_file strategy
 VERSION_MAP: dict = {}
@@ -88,30 +98,28 @@ for pair in os.environ.get("CHANGELOG_URLS", "").split("|"):
         k, v = pair.strip().split("=", 1)
         CHANGELOGS[k.strip()] = v.strip()
 
+# Shared HTTP session for registry and webhook calls
+_session = req.Session()
+
 # ---------------------------------------------------------------------------
-# Docker client (lazy singleton — one connection, reused across requests)
+# Docker client (one connection, reconnected if stale)
 # ---------------------------------------------------------------------------
 _docker_client = None
-_docker_lock   = threading.Lock()
+_docker_lock = threading.Lock()
+
 
 def get_docker_client():
-    """
-    Return a connected Docker client, reconnecting automatically if the
-    previous connection is stale (e.g. after a Docker daemon restart).
-    """
     global _docker_client
-    if _docker_client is not None:
-        try:
-            _docker_client.ping()   # lightweight liveness check
-            return _docker_client
-        except Exception:
-            log.warning("Docker client connection lost — reconnecting...")
-            with _docker_lock:
-                _docker_client = None
     with _docker_lock:
-        if _docker_client is None:
-            _docker_client = dockerlib.from_env()
-    return _docker_client
+        if _docker_client is not None:
+            try:
+                _docker_client.ping()
+                return _docker_client
+            except Exception:
+                log.warning("Docker client connection lost — reconnecting...")
+                _docker_client = None
+        _docker_client = dockerlib.from_env()
+        return _docker_client
 
 
 # ---------------------------------------------------------------------------
@@ -130,119 +138,88 @@ STRATEGY_LABELS = {
 # ---------------------------------------------------------------------------
 # Job tracking (in-memory, for live progress reporting)
 # ---------------------------------------------------------------------------
-_jobs: dict = {}         # {job_id: {log, done, success, error, message, started}}
+_jobs: dict = {}
 _jobs_lock = threading.Lock()
 
-# Check timing
 _last_check_time: float = 0.0
 _next_check_time: float = 0.0
 
-# Active operation guard — prevents two simultaneous updates on the same container
+# Update guard: one operation per container at a time
 _active_containers: set = set()
 _active_lock = threading.Lock()
-_check_running    = threading.Event() # set while a check is in progress
-_check_started_at : float = 0.0       # timestamp when check started (stuck-flag detection)
+
+# Check guard: lock-based so the debounce is atomic (no check-then-set race)
+_check_lock = threading.Lock()
+_check_running = threading.Event()        # mirrors _check_lock for /api/status
+
+# Set when the check interval is changed so the scheduler re-reads it
+_interval_changed = threading.Event()
 
 
 def _new_job() -> str:
     job_id = str(uuid.uuid4())[:8]
+    now = time.time()
     with _jobs_lock:
         _jobs[job_id] = {
-            "log":     [],
-            "done":    False,
-            "success": False,
-            "error":   "",
-            "message": "",
-            "started": time.time(),
+            "log": [], "done": False, "success": False,
+            "error": "", "message": "", "started": now,
         }
-    # Prune jobs older than 10 minutes
-    cutoff = time.time() - 600
-    with _jobs_lock:
-        stale = [k for k, v in _jobs.items() if v["started"] < cutoff and v["done"]]
-        for k in stale:
+        cutoff = now - 600
+        for k in [k for k, v in _jobs.items() if v["started"] < cutoff and v["done"]]:
             del _jobs[k]
     return job_id
 
 
-def _jlog(job_id: str, msg: str, level: str = "info"):
-    _log_fn = {"error": log.error, "warn": log.warning, "warning": log.warning}.get(level, log.info)
-    _log_fn("[job:%s] %s", job_id, msg)
+def _jlog(job_id, msg: str, level: str = "info"):
+    log_fn = {"error": log.error, "warn": log.warning, "warning": log.warning}.get(level, log.info)
+    log_fn("[job:%s] %s", job_id, msg)
     if job_id:
         with _jobs_lock:
             if job_id in _jobs:
                 _jobs[job_id]["log"].append({
-                    "t":   datetime.now().strftime("%H:%M:%S"),
+                    "t": datetime.now().strftime("%H:%M:%S"),
                     "msg": msg,
                     "lvl": level,
                 })
 
 
-def _job_done(job_id: str, success: bool, message: str = "", error: str = ""):
+def _job_done(job_id, success: bool, message: str = "", error: str = ""):
     with _jobs_lock:
         if job_id in _jobs:
-            _jobs[job_id]["done"]    = True
-            _jobs[job_id]["success"] = success
-            _jobs[job_id]["message"] = message
-            _jobs[job_id]["error"]   = error
+            _jobs[job_id].update(done=True, success=success, message=message, error=error)
 
 
 # ---------------------------------------------------------------------------
 # Tag filtering
 # ---------------------------------------------------------------------------
-_DEV_KEYWORDS = [
-    "alpha", "beta", "rc", "nightly", "edge", "dev", "test",
-    "snapshot", "experimental", "-b.", ".b.",
-    # CI/CD build tags — never real releases
-    "pr-", "-pr.", "feature-", "feat-", "fix-", "hotfix-",
-    "staging", "canary", "preview", "prerelease", "pre-release",
-    "refs-", "sha-", "build-", "ci-", "main-", "master-",
-]
-_ARCH_KEYWORDS = [
-    "arm64v8", "amd64", "armhf", "arm32v7", "i386", "ppc64le",
-    "s390x", "linux-", "-arm64", "-armv7", "-armv6", "-aarch64",
-]
-# Hardware/runtime variant suffixes — these are specialised builds of the
-# same release, not newer versions. e.g. v2.7.4-openvino, v2.7.4-cuda,
-# v2.7.4-rocm. Filter them so the plain release tag is always preferred.
-_VARIANT_KEYWORDS = [
-    "-openvino", "-cuda", "-rocm", "-tensorrt", "-gpu",
-    "-cpu", "-onnx", "-mlkit", "-coreml",
-]
-
-# Tags must look like a version to be considered.
-# Accepts: 1.2.3  v1.2.3  V1.2.3  version-1.2.3  1.2.3-4  1.43.0.10492-abc07
-# Rejects: pr-1633  feature-xyz  latest  main
-_VERSION_RE = re.compile(r"^(?:version-|[vV])?(\d+)([.\-]\d+)*([.\-][a-zA-Z0-9]+)?$")
+_PRE_WORDS = r"alpha|beta|rc|nightly|edge|dev|devel|test|snapshot|experimental|staging|canary|preview|prerelease|pre-release"
+_CI_WORDS  = r"pr|feature|feat|fix|hotfix|refs|sha|build|ci|main|master"
+_PRE_RE    = re.compile(rf"(?:^|[-_.])(?:{_PRE_WORDS})(?=$|[-_.\d])", re.I)
+_CI_RE     = re.compile(rf"(?:^|[-_.])(?:{_CI_WORDS})(?=$|[-_.\d])", re.I)
+_ARCH_RE   = re.compile(r"(?:^|[-_.])(?:amd64|arm64v8|arm64|armhf|arm32v7|armv7|armv6|aarch64|i386|ppc64le|s390x|linux)(?=$|[-_.])", re.I)
+# Hardware/runtime variants of the same release, not newer versions
+_VARIANT_RE = re.compile(r"-(?:openvino|cuda|rocm|tensorrt|gpu|cpu|onnx|mlkit|coreml)(?=$|[-.])", re.I)
+_LS_RE      = re.compile(r"-ls\d+|-lt\d+-", re.I)
+_VERSION_RE = re.compile(r"^(?:version-|[vV])?\d+([.\-]\d+)*([.\-][a-zA-Z0-9]+)?$")
+_NUM_RE     = re.compile(r"^(?:version-|[vV])?(\d+(?:[.\-]\d+)*)")
 
 
 def is_stable_tag(tag: str) -> bool:
-    if ALLOW_PRERELEASE:
-        # Even with pre-releases on, reject obvious CI noise
-        tl = tag.lower()
-        return not any(kw in tl for kw in ("pr-", "feature-", "feat-", "sha-", "build-", "refs-"))
-    tl = tag.lower()
-    if any(kw in tl for kw in _DEV_KEYWORDS):
+    if not tag or not TAG_RE.match(tag):
         return False
-    if any(arch in tl for arch in _ARCH_KEYWORDS):
+    if _CI_RE.search(tag) or _ARCH_RE.search(tag) or _VARIANT_RE.search(tag) or _LS_RE.search(tag):
         return False
-    if re.search(r"-ls\d+", tl):
+    if not ALLOW_PRERELEASE and _PRE_RE.search(tag):
         return False
-    if re.search(r"-lt\d+-", tl):
-        return False
-    # Reject hardware/runtime variant tags (e.g. v2.7.4-openvino, v2.7.4-cuda)
-    # These are specialised builds, not newer releases.
-    if any(kw in tl for kw in _VARIANT_KEYWORDS):
-        return False
-    # Must look like a version number — rejects 'latest', 'main', 'pr-1633', etc.
-    if not _VERSION_RE.match(tag):
-        return False
-    return True
+    return bool(_VERSION_RE.match(tag))
 
 
 def version_tuple(tag: str) -> tuple:
-    cleaned = tag.replace("version-", "").lstrip("vV")
-    numbers = re.findall(r"\d+", cleaned)
-    return tuple(int(n) for n in numbers) if numbers else (0,)
+    """Compare on the leading numeric version only, so hash suffixes don't count."""
+    m = _NUM_RE.match(tag or "")
+    if not m:
+        return (0,)
+    return tuple(int(n) for n in re.split(r"[.\-]", m.group(1)))
 
 
 def is_newer(current: str, candidate: str) -> bool:
@@ -252,37 +229,41 @@ def is_newer(current: str, candidate: str) -> bool:
         return False
 
 
+def _find_newest_tag(tags, current_tag: str):
+    newest = None
+    for tag in tags:
+        if not tag or not is_stable_tag(tag) or not is_newer(current_tag, tag):
+            continue
+        if newest is None or is_newer(newest, tag):
+            newest = tag
+    return newest
+
+
 # ---------------------------------------------------------------------------
 # Registry queries
 # ---------------------------------------------------------------------------
 
-def _req_get(url: str, headers: dict = None, timeout: int = 10,
-             max_attempts: int = 3) -> "req.Response | None":
-    """GET with exponential-backoff retry and Retry-After / rate-limit awareness."""
+def _req_get(url: str, headers: dict = None, timeout: int = 10, max_attempts: int = 3):
+    """GET with exponential backoff and Retry-After / rate-limit awareness."""
+    resp = None
     for attempt in range(max_attempts):
         try:
-            resp = req.get(url, headers=headers or {}, timeout=timeout)
-            # Honour rate-limit backoff headers
+            resp = _session.get(url, headers=headers or {}, timeout=timeout)
             if resp.status_code == 429:
                 retry_after = int(resp.headers.get("Retry-After", 10))
                 log.warning("Rate-limited by %s — waiting %ds", url[:60], retry_after)
                 time.sleep(min(retry_after, 60))
                 continue
-            # On transient server errors, back off and retry
             if resp.status_code >= 500 and attempt < max_attempts - 1:
-                delay = 2 ** attempt
-                log.debug("HTTP %s from %s, retrying in %ds", resp.status_code, url[:60], delay)
-                time.sleep(delay)
+                time.sleep(2 ** attempt)
                 continue
             return resp
         except (req.exceptions.ConnectionError, req.exceptions.Timeout) as exc:
             if attempt < max_attempts - 1:
-                delay = 2 ** attempt
-                log.debug("Request error (%s), retrying in %ds: %s", type(exc).__name__, delay, url[:60])
-                time.sleep(delay)
+                time.sleep(2 ** attempt)
             else:
                 log.error("Request failed after %d attempts: %s — %s", max_attempts, url[:60], exc)
-    return None
+    return resp
 
 
 def _ghcr_headers() -> dict:
@@ -293,8 +274,6 @@ def _ghcr_headers() -> dict:
 
 
 def query_dockerhub(org: str, repo: str, current_tag: str):
-    # Fetch up to 5 pages of 100 tags each (500 total) following Docker Hub
-    # "next" pagination URL. Uses _req_get for retry + rate-limit handling.
     url = f"https://hub.docker.com/v2/repositories/{org}/{repo}/tags?page_size=100&ordering=last_updated"
     all_tags = []
     page = 0
@@ -304,14 +283,13 @@ def query_dockerhub(org: str, repo: str, current_tag: str):
             resp = _req_get(url)
             if resp is None or resp.status_code != 200:
                 log.warning("DockerHub %s/%s HTTP %s", org, repo,
-                            resp.status_code if resp else "no-response")
+                            resp.status_code if resp is not None else "no-response")
                 break
-            # Warn when rate limit is running low
             remaining = resp.headers.get("X-RateLimit-Remaining")
             if remaining and int(remaining) < 10:
                 log.warning("DockerHub rate limit low: %s requests remaining", remaining)
             body = resp.json()
-            all_tags.extend(t["name"] for t in body.get("results", []) if is_stable_tag(t["name"]))
+            all_tags.extend(t["name"] for t in body.get("results", []))
             url = body.get("next")
         return _find_newest_tag(all_tags, current_tag)
     except Exception as exc:
@@ -319,25 +297,11 @@ def query_dockerhub(org: str, repo: str, current_tag: str):
         return None
 
 
-def _find_newest_tag(tags: list, current_tag: str):
-    """Return the highest stable tag newer than current_tag, or None."""
-    newest = None
-    for tag in tags:
-        if not tag or tag.startswith("sha") or not is_stable_tag(tag):
-            continue
-        if is_newer(current_tag, tag):
-            if newest is None or is_newer(newest, tag):
-                newest = tag
-    return newest
-
-
 def _parse_link_next(link_header: str) -> str:
-    """Extract the next page URL from a Link header."""
     for part in link_header.split(","):
         part = part.strip()
         if 'rel="next"' in part:
             url = part.split(";")[0].strip().strip("<>")
-            # Make absolute if registry returns a relative path
             if url.startswith("/"):
                 url = "https://ghcr.io" + url
             return url
@@ -346,120 +310,80 @@ def _parse_link_next(link_header: str) -> str:
 
 def _query_ghcr_registry_api(org: str, repo: str, current_tag: str):
     """
-    Query the Docker Registry v2 API on ghcr.io.
-
-    Images like immich-server have 20,000+ tags sorted alphabetically.
-    Naive forward pagination would need 20+ pages to reach v2.x tags.
-
-    Strategy:
-      1. Use current_tag as a `last` cursor — the registry returns tags
-         that sort AFTER it alphabetically, so we land exactly where
-         newer versions live. Fetch 3 pages of 200 tags (600 candidates).
-      2. If that finds nothing (e.g. current_tag is not a real version,
-         or the image has no newer tags in that range), fall back to a
-         forward scan from the beginning capped at 5 pages.
-
-    This means 1-3 requests for the common case instead of 10-20+.
+    Docker Registry v2 API on ghcr.io. Tags sort alphabetically, so we start
+    the scan at current_tag and walk forward. Falls back to a scan from the
+    beginning if the cursor pass finds nothing.
     """
     image_path = f"{org}/{repo}"
     try:
         tok_resp = _req_get(f"https://ghcr.io/token?scope=repository:{image_path}:pull")
         if tok_resp is None or tok_resp.status_code != 200:
-            log.warning("GHCR registry token %s HTTP %s", image_path,
-                        tok_resp.status_code if tok_resp else "no-response")
+            log.warning("GHCR token %s HTTP %s", image_path,
+                        tok_resp.status_code if tok_resp is not None else "no-response")
             return None
         token = tok_resp.json().get("token")
         if not token:
             return None
-
         headers = {"Authorization": f"Bearer {token}"}
 
         def _fetch_pages(start_url: str, max_pages: int) -> list:
-            tags = []
-            url  = start_url
-            page = 0
+            tags, url, page = [], start_url, 0
             while url and page < max_pages:
                 page += 1
                 resp = _req_get(url, headers=headers)
                 if resp is None or resp.status_code != 200:
                     log.warning("GHCR tags %s page %d HTTP %s", image_path, page,
-                                resp.status_code if resp else "no-response")
+                                resp.status_code if resp is not None else "no-response")
                     break
                 tags.extend(resp.json().get("tags") or [])
                 url = _parse_link_next(resp.headers.get("Link", ""))
             return tags
 
-        # ── Pass 1: cursor from current_tag ───────────────────────────────
-        # The registry returns tags alphabetically after the cursor, so we
-        # land just past the current version. Fetch 20 pages of 500 (10,000
-        # candidates) which covers even immich's gap of thousands of dev tags
-        # between releases.
-        cursor = current_tag.lstrip("vV")
-        if current_tag.startswith(("v", "V")):
-            cursor = "v" + cursor
-        cursor_url = (f"https://ghcr.io/v2/{image_path}/tags/list"
-                      f"?n=500&last={cursor}")
-        all_tags = _fetch_pages(cursor_url, max_pages=20)
-        result   = _find_newest_tag(all_tags, current_tag)
-
+        cursor = current_tag
+        cursor_url = f"https://ghcr.io/v2/{image_path}/tags/list?n=500&last={cursor}"
+        result = _find_newest_tag(_fetch_pages(cursor_url, max_pages=20), current_tag)
         if result:
-            log.info("GHCR registry API (cursor) found %s for %s (current: %s)",
-                     result, image_path, current_tag)
             return result
 
-        # ── Pass 2: fallback forward scan from start ───────────────────────
-        # Handles cases where current_tag cursor is unreliable (e.g. 'latest')
-        log.debug("GHCR cursor pass found nothing for %s — trying forward scan",
-                  image_path)
-        all_tags = _fetch_pages(
-            f"https://ghcr.io/v2/{image_path}/tags/list?n=1000",
-            max_pages=5
+        return _find_newest_tag(
+            _fetch_pages(f"https://ghcr.io/v2/{image_path}/tags/list?n=1000", max_pages=5),
+            current_tag,
         )
-        result = _find_newest_tag(all_tags, current_tag)
-        if result:
-            log.info("GHCR registry API (forward) found %s for %s (current: %s)",
-                     result, image_path, current_tag)
-        return result
-
     except Exception as exc:
         log.error("_query_ghcr_registry_api %s/%s: %s", org, repo, exc)
         return None
 
 
 def query_ghcr(org: str, repo: str, current_tag: str):
-    """
-    Try the GitHub Packages API first (requires token for some packages).
-    Fall back to the Docker Registry v2 API on ghcr.io, which works
-    anonymously for all public images.
-    """
-    # ── Attempt 1: GitHub Packages API (org endpoint) ──────────────────────
-    url = f"https://api.github.com/orgs/{org}/packages/container/{repo}/versions?per_page=100"
+    # Attempt 1: GitHub Packages API (org, then user). Needs a token for some packages.
     try:
+        url = f"https://api.github.com/orgs/{org}/packages/container/{repo}/versions?per_page=100"
         resp = _req_get(url, headers=_ghcr_headers())
         if resp is not None and resp.status_code in (401, 404):
-            # Try user endpoint (personal accounts like FlareSolverr, advplyr)
             url = f"https://api.github.com/users/{org}/packages/container/{repo}/versions?per_page=100"
             resp = _req_get(url, headers=_ghcr_headers())
-
         if resp is not None and resp.status_code == 200:
             all_tags = []
             for version in resp.json():
-                all_tags.extend(
-                    version.get("metadata", {}).get("container", {}).get("tags", [])
-                )
+                all_tags.extend(version.get("metadata", {}).get("container", {}).get("tags", []))
             result = _find_newest_tag(all_tags, current_tag)
             if result is not None:
                 return result
-            # Got 200 but found nothing newer — could be auth hiding versions
-            log.debug("GHCR packages API returned 200 for %s/%s but no newer tag found", org, repo)
-        else:
-            log.warning("GHCR packages API %s/%s HTTP %s — falling back to registry API",
-                        org, repo, resp.status_code if resp else "no-response")
     except Exception as exc:
-        log.warning("GHCR packages API %s/%s error: %s — falling back to registry API", org, repo, exc)
+        log.warning("GHCR packages API %s/%s error: %s", org, repo, exc)
 
-    # ── Attempt 2: Docker Registry v2 API (always works for public images) ─
+    # Attempt 2: registry v2 API, works anonymously for public images
     return _query_ghcr_registry_api(org, repo, current_tag)
+
+
+def _split_image(image_ref: str):
+    """'registry:5000/repo/name:tag' -> ('registry:5000/repo/name', 'tag'). Digests are dropped."""
+    ref = (image_ref or "").split("@", 1)[0]
+    last_slash = ref.rfind("/")
+    colon = ref.rfind(":")
+    if colon > last_slash:
+        return ref[:colon], ref[colon + 1:]
+    return ref, "latest"
 
 
 def get_latest_tag(image: str, current_tag: str):
@@ -478,10 +402,7 @@ def get_latest_tag(image: str, current_tag: str):
         parts = img.split("/")
         if len(parts) == 1:
             return query_dockerhub("library", parts[0], current_tag)
-        elif len(parts) == 2:
-            return query_dockerhub(parts[0], parts[1], current_tag)
-        else:
-            return query_dockerhub(parts[-2], parts[-1], current_tag)
+        return query_dockerhub(parts[-2], parts[-1], current_tag)
     except Exception as exc:
         log.error("get_latest_tag %s: %s", image, exc)
         return None
@@ -521,11 +442,8 @@ def get_changelog(image: str, label_override: str = None):
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
+_SCHEMA_VERSION = 2
 
-# Current schema version — increment when adding migrations below
-_SCHEMA_VERSION = 3
-
-# Each entry is (version, sql) — run in order when upgrading
 _MIGRATIONS = [
     (1, """CREATE TABLE IF NOT EXISTS version_history (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -536,258 +454,67 @@ _MIGRATIONS = [
     (2, """CREATE TABLE IF NOT EXISTS dismissed_updates (
                container TEXT, tag TEXT, dismissed_at TEXT,
                PRIMARY KEY (container, tag))"""),
-    (3, """CREATE TABLE IF NOT EXISTS active_jobs (
-               container TEXT PRIMARY KEY, job_id TEXT, strategy TEXT,
-               from_tag TEXT, to_tag TEXT, step TEXT, started_at TEXT)"""),
 ]
 
 
 def _get_conn() -> sqlite3.Connection:
-    """Open a WAL-mode connection to the database."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
+@contextlib.contextmanager
+def _db():
+    """Connection that is always closed, and committed on clean exit."""
+    conn = _get_conn()
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def init_db():
     db_dir = os.path.dirname(DB_PATH)
     os.makedirs(db_dir, exist_ok=True)
-    try:
-        data_dev   = os.stat(db_dir).st_dev
-        parent_dev = os.stat(os.path.dirname(db_dir.rstrip("/"))).st_dev
-        if data_dev == parent_dev:
-            log.warning("=" * 60)
-            log.warning("PERSISTENCE WARNING: %s is not a bind-mounted host", db_dir)
-            log.warning("directory. History and rollback data will be LOST on restart.")
-            log.warning("Add to compose.yaml:  - /stacks/data/dummy:/data")
-            log.warning("=" * 60)
-        else:
-            log.info("Persistence OK — %s is a bind-mounted volume.", db_dir)
-    except Exception as exc:
-        log.warning("Could not verify persistence of %s: %s", db_dir, exc)
+    if not _check_persistence():
+        log.warning("PERSISTENCE WARNING: %s is not a bind-mounted volume. History will be lost on restart.", db_dir)
+    else:
+        log.info("Persistence OK — %s is a bind-mounted volume.", db_dir)
 
-    conn = _get_conn()
-    c = conn.cursor()
-    # Bootstrap schema_version table
-    c.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)")
-    c.execute("SELECT COALESCE(MAX(version), 0) FROM schema_version")
-    current = c.fetchone()[0]
-    for version, sql in _MIGRATIONS:
-        if version > current:
-            log.info("DB migration: applying schema v%d", version)
-            c.executescript(sql)
-            c.execute("INSERT OR REPLACE INTO schema_version VALUES (?)", (version,))
-    conn.commit()
-    conn.close()
+    with _db() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)")
+        current = conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_version").fetchone()[0]
+        for version, sql in _MIGRATIONS:
+            if version > current:
+                log.info("DB migration: applying schema v%d", version)
+                conn.executescript(sql)
+                conn.execute("INSERT OR REPLACE INTO schema_version VALUES (?)", (version,))
     log.info("DB schema up to date (v%d)", _SCHEMA_VERSION)
-
-
-# ---------------------------------------------------------------------------
-# Database backups
-# ---------------------------------------------------------------------------
-
-def backup_db() -> str | None:
-    """
-    Snapshot versions.db using SQLite's online backup API — safe to run
-    against a live WAL-mode DB (unlike copying the raw file, which can grab
-    an inconsistent mid-write state). Returns the backup path on success.
-    """
-    try:
-        os.makedirs(DB_BACKUP_DIR, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        dest_path = os.path.join(DB_BACKUP_DIR, f"versions-{stamp}.db")
-
-        src = sqlite3.connect(DB_PATH)
-        dest = sqlite3.connect(dest_path)
-        with dest:
-            src.backup(dest)
-        dest.close()
-        src.close()
-
-        size_kb = os.path.getsize(dest_path) / 1024
-        log.info("DB backup written: %s (%.1f KB)", dest_path, size_kb)
-        _prune_old_backups()
-        return dest_path
-    except Exception as exc:
-        log.error("backup_db: %s", exc)
-        return None
-
-
-def _prune_old_backups():
-    """Keep only the DB_BACKUP_KEEP most recent backups."""
-    try:
-        if not os.path.isdir(DB_BACKUP_DIR):
-            return
-        backups = sorted(
-            (f for f in os.listdir(DB_BACKUP_DIR) if f.startswith("versions-") and f.endswith(".db")),
-            reverse=True,
-        )
-        for stale in backups[DB_BACKUP_KEEP:]:
-            try:
-                os.remove(os.path.join(DB_BACKUP_DIR, stale))
-                log.debug("Pruned old DB backup: %s", stale)
-            except OSError as exc:
-                log.warning("Could not prune backup %s: %s", stale, exc)
-    except Exception as exc:
-        log.error("_prune_old_backups: %s", exc)
-
-
-def list_db_backups() -> list:
-    """Return backup filenames (newest first) with size and mtime, for the UI."""
-    try:
-        if not os.path.isdir(DB_BACKUP_DIR):
-            return []
-        out = []
-        for f in os.listdir(DB_BACKUP_DIR):
-            if f.startswith("versions-") and f.endswith(".db"):
-                full = os.path.join(DB_BACKUP_DIR, f)
-                out.append({
-                    "filename": f,
-                    "size_kb": round(os.path.getsize(full) / 1024, 1),
-                    "created_at": datetime.fromtimestamp(os.path.getmtime(full)).isoformat(),
-                })
-        return sorted(out, key=lambda b: b["created_at"], reverse=True)
-    except Exception as exc:
-        log.error("list_db_backups: %s", exc)
-        return []
-
-
-def run_db_backups():
-    """Background loop: back up the DB on startup, then every DB_BACKUP_INTERVAL."""
-    if not DB_BACKUP_ENABLED:
-        log.info("DB backups disabled (DB_BACKUP_ENABLED=false)")
-        return
-    log.info("DB backups enabled — every %dh, keeping last %d, dir=%s",
-              DB_BACKUP_INTERVAL // 3600, DB_BACKUP_KEEP, DB_BACKUP_DIR)
-    while True:
-        backup_db()
-        time.sleep(DB_BACKUP_INTERVAL)
 
 
 def add_to_history(container: str, tag: str, status: str = "deployed"):
     try:
         limit = get_all_settings()["history_limit"]
-        conn = _get_conn()
-        c = conn.cursor()
-        c.execute("INSERT INTO version_history (container,tag,deployed_at,status) VALUES (?,?,?,?)",
-                  (container, tag, datetime.now().isoformat(), status))
-        c.execute("""DELETE FROM version_history WHERE id NOT IN (
-            SELECT id FROM version_history WHERE container=? ORDER BY deployed_at DESC LIMIT ?)""",
-                  (container, limit))
-        conn.commit()
-        conn.close()
+        with _db() as conn:
+            conn.execute("INSERT INTO version_history (container,tag,deployed_at,status) VALUES (?,?,?,?)",
+                         (container, tag, datetime.now().isoformat(), status))
+            conn.execute("""DELETE FROM version_history WHERE container=? AND id NOT IN (
+                SELECT id FROM version_history WHERE container=? ORDER BY deployed_at DESC LIMIT ?)""",
+                         (container, container, limit))
     except Exception as exc:
         log.error("add_to_history: %s", exc)
 
 
-# ---------------------------------------------------------------------------
-# Crash-safe job tracking
-#
-# update_service() is multi-step (write .env/compose -> recreate container ->
-# health check). If the DUMMY process dies mid-update (crash, forced restart,
-# OOM, power loss), those steps can be left half-done with no record of it —
-# e.g. .env gets reverted to an old tag but the container never gets
-# recreated to match. That's not hypothetical: it happened to a Plex
-# rollback that got interrupted by an unrelated container restart.
-#
-# We persist a row for the duration of each update/rollback. A row that's
-# still there on the NEXT startup means the previous run never finished
-# cleanly, and we can't trust .env/compose to match the real container.
-# ---------------------------------------------------------------------------
-
-def _job_begin(container: str, job_id: str, strategy: str, from_tag: str, to_tag: str):
-    try:
-        conn = _get_conn()
-        c = conn.cursor()
-        c.execute("""INSERT OR REPLACE INTO active_jobs
-                     (container, job_id, strategy, from_tag, to_tag, step, started_at)
-                     VALUES (?,?,?,?,?,?,?)""",
-                  (container, job_id, strategy, from_tag, to_tag, "started",
-                   datetime.now().isoformat()))
-        conn.commit()
-        conn.close()
-    except Exception as exc:
-        log.error("_job_begin %s: %s", container, exc)
-
-
-def _job_step(container: str, step: str):
-    """Checkpoint progress so a startup reconciliation can pinpoint where an
-    interrupted job died (e.g. 'env_written' vs 'recreated' vs 'healthy')."""
-    try:
-        conn = _get_conn()
-        c = conn.cursor()
-        c.execute("UPDATE active_jobs SET step=? WHERE container=?", (step, container))
-        conn.commit()
-        conn.close()
-    except Exception as exc:
-        log.error("_job_step %s: %s", container, exc)
-
-
-def _job_end(container: str):
-    """Clear the in-progress marker. Called on every resolved outcome
-    (success, handled failure + rollback) — NOT called on process death,
-    which is exactly what leaves a row behind for startup to find."""
-    try:
-        conn = _get_conn()
-        c = conn.cursor()
-        c.execute("DELETE FROM active_jobs WHERE container=?", (container,))
-        conn.commit()
-        conn.close()
-    except Exception as exc:
-        log.error("_job_end %s: %s", container, exc)
-
-
-def check_for_interrupted_jobs():
-    """
-    Run once at startup. Any row still in active_jobs means the last update
-    never completed cleanly. We can't safely auto-resolve which of
-    .env/compose vs the real container is correct, so we surface it loudly
-    (log + ntfy) rather than let it drift unnoticed, then clear the marker
-    so it doesn't re-alert on every subsequent restart.
-    """
-    try:
-        conn = _get_conn()
-        c = conn.cursor()
-        c.execute("SELECT container, job_id, strategy, from_tag, to_tag, step, started_at FROM active_jobs")
-        rows = c.fetchall()
-        if rows:
-            for container, job_id, strategy, from_tag, to_tag, step, started_at in rows:
-                log.warning("=" * 60)
-                log.warning("INTERRUPTED UPDATE DETECTED: %s", container)
-                log.warning(
-                    "  %s -> %s (strategy=%s) was interrupted at step '%s' "
-                    "(started %s) and never completed cleanly — likely a "
-                    "crash or forced restart mid-update.",
-                    from_tag, to_tag, strategy, step, started_at
-                )
-                log.warning(
-                    "  Verify %s's actual running image/tag manually before "
-                    "trusting the dashboard or .env/compose file for it.",
-                    container
-                )
-                log.warning("=" * 60)
-                notify(
-                    f"Interrupted update: {container}",
-                    f"{from_tag} → {to_tag} was interrupted at '{step}' — verify the "
-                    f"running container manually before trusting the dashboard.",
-                    priority="4", tags="warning",
-                )
-            c.execute("DELETE FROM active_jobs")
-            conn.commit()
-        conn.close()
-    except Exception as exc:
-        log.error("check_for_interrupted_jobs: %s", exc)
-
-
 def get_history(container: str) -> list:
+    """Most recent first, capped by the Settings history limit (not the env default)."""
     try:
-        conn = _get_conn()
-        c = conn.cursor()
-        c.execute("SELECT tag,deployed_at,status FROM version_history WHERE container=? ORDER BY deployed_at DESC LIMIT ?",
-                  (container, HISTORY_LIMIT))
-        rows = c.fetchall()
-        conn.close()
+        limit = get_all_settings()["history_limit"]
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT tag,deployed_at,status FROM version_history WHERE container=? "
+                "ORDER BY deployed_at DESC LIMIT ?", (container, limit)).fetchall()
         return [{"tag": r[0], "date": r[1], "status": r[2]} for r in rows]
     except Exception:
         return []
@@ -795,138 +522,116 @@ def get_history(container: str) -> list:
 
 def save_available_update(container: str, tag: str):
     try:
-        conn = _get_conn()
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO available_updates VALUES (?,?,?)",
-                  (container, tag, datetime.now().isoformat()))
-        conn.commit()
-        conn.close()
+        with _db() as conn:
+            conn.execute("INSERT OR REPLACE INTO available_updates VALUES (?,?,?)",
+                         (container, tag, datetime.now().isoformat()))
     except Exception as exc:
         log.error("save_available_update: %s", exc)
 
 
 def clear_available_update(container: str):
     try:
-        conn = _get_conn()
-        c = conn.cursor()
-        c.execute("DELETE FROM available_updates WHERE container=?", (container,))
-        conn.commit()
-        conn.close()
+        with _db() as conn:
+            conn.execute("DELETE FROM available_updates WHERE container=?", (container,))
     except Exception as exc:
         log.error("clear_available_update: %s", exc)
 
 
-# ---------------------------------------------------------------------------
-# Dismissed updates
-# ---------------------------------------------------------------------------
-
 def is_dismissed(container: str, tag: str) -> bool:
-    """Return True if the user has dismissed this specific update."""
     try:
-        conn = _get_conn()
-        c = conn.cursor()
-        c.execute("SELECT 1 FROM dismissed_updates WHERE container=? AND tag=?", (container, tag))
-        found = c.fetchone() is not None
-        conn.close()
-        return found
+        with _db() as conn:
+            return conn.execute("SELECT 1 FROM dismissed_updates WHERE container=? AND tag=?",
+                                (container, tag)).fetchone() is not None
     except Exception:
         return False
 
 
 def dismiss_update(container: str, tag: str):
-    """Dismiss an available update so it no longer shows as actionable."""
     try:
-        conn = _get_conn()
-        c = conn.cursor()
-        c.execute("INSERT OR IGNORE INTO dismissed_updates VALUES (?,?,?)",
-                  (container, tag, datetime.now().isoformat()))
-        conn.commit()
-        conn.close()
+        with _db() as conn:
+            conn.execute("INSERT OR IGNORE INTO dismissed_updates VALUES (?,?,?)",
+                         (container, tag, datetime.now().isoformat()))
         log.info("Dismissed update %s → %s", container, tag)
     except Exception as exc:
         log.error("dismiss_update: %s", exc)
 
 
 def undismiss_update(container: str, tag: str = None):
-    """Re-enable a dismissed update (or all for a container if tag is None)."""
     try:
-        conn = _get_conn()
-        c = conn.cursor()
-        if tag:
-            c.execute("DELETE FROM dismissed_updates WHERE container=? AND tag=?", (container, tag))
-        else:
-            c.execute("DELETE FROM dismissed_updates WHERE container=?", (container,))
-        conn.commit()
-        conn.close()
+        with _db() as conn:
+            if tag:
+                conn.execute("DELETE FROM dismissed_updates WHERE container=? AND tag=?", (container, tag))
+            else:
+                conn.execute("DELETE FROM dismissed_updates WHERE container=?", (container,))
     except Exception as exc:
         log.error("undismiss_update: %s", exc)
 
 
-def get_dismissed(container: str) -> list:
-    """Return all dismissed tags for a container."""
+def _fetch_container_data_bulk(container_names: list) -> dict:
+    """One DB round-trip for available updates, history and dismissals."""
+    if not container_names:
+        return {}
     try:
-        conn = _get_conn()
-        c = conn.cursor()
-        c.execute("SELECT tag, dismissed_at FROM dismissed_updates WHERE container=? ORDER BY dismissed_at DESC",
-                  (container,))
-        rows = c.fetchall()
-        conn.close()
-        return [{"tag": r[0], "dismissed_at": r[1]} for r in rows]
-    except Exception:
-        return []
+        limit = get_all_settings()["history_limit"]
+        ph = ",".join("?" * len(container_names))
+        with _db() as conn:
+            avail = {r[0]: (r[1], r[2]) for r in conn.execute(
+                f"SELECT container, available_tag, checked_at FROM available_updates WHERE container IN ({ph})",
+                container_names)}
+            hist_raw: dict = {}
+            for r in conn.execute(
+                    f"SELECT container, tag, deployed_at, status FROM version_history "
+                    f"WHERE container IN ({ph}) ORDER BY deployed_at DESC", container_names):
+                hist_raw.setdefault(r[0], []).append({"tag": r[1], "date": r[2], "status": r[3]})
+            dismissed: dict = {}
+            for r in conn.execute(
+                    f"SELECT container, tag, dismissed_at FROM dismissed_updates "
+                    f"WHERE container IN ({ph}) ORDER BY dismissed_at DESC", container_names):
+                dismissed.setdefault(r[0], []).append({"tag": r[1], "dismissed_at": r[2]})
 
-
-# ---------------------------------------------------------------------------
-# Webhook
-# ---------------------------------------------------------------------------
-
-def send_webhook(event: str, data: dict):
-    """POST a JSON event payload to WEBHOOK_URL if configured."""
-    if not WEBHOOK_URL:
-        return
-    payload = {"event": event, "timestamp": datetime.now().isoformat(), **data}
-    try:
-        resp = req.post(WEBHOOK_URL, json=payload, timeout=10)
-        if resp.status_code >= 400:
-            log.warning("Webhook %s returned HTTP %s", event, resp.status_code)
-        else:
-            log.debug("Webhook %s sent OK", event)
+        result = {}
+        for name in container_names:
+            av_tag, checked_at = avail.get(name, (None, ""))
+            if av_tag and not is_stable_tag(av_tag):
+                av_tag = None
+            dismissed_list = dismissed.get(name, [])
+            result[name] = {
+                "available_tag": av_tag,
+                "checked_at": checked_at or "",
+                "history": hist_raw.get(name, [])[:limit],
+                "dismissed": dismissed_list,
+                "dismissed_tags": {d["tag"] for d in dismissed_list},
+            }
+        return result
     except Exception as exc:
-        log.warning("Webhook failed (%s): %s", event, exc)
+        log.error("_fetch_container_data_bulk: %s", exc)
+        return {}
+
+
+def cleanup_stale_containers():
+    """Drop update/dismiss rows for containers that no longer exist. History is kept."""
+    try:
+        live = {c.name for c in get_docker_client().containers.list(all=True)}
+        with _db() as conn:
+            stale = [r[0] for r in conn.execute("SELECT DISTINCT container FROM available_updates")
+                     if r[0] not in live]
+            if stale:
+                ph = ",".join("?" * len(stale))
+                conn.execute(f"DELETE FROM available_updates WHERE container IN ({ph})", stale)
+                conn.execute(f"DELETE FROM dismissed_updates WHERE container IN ({ph})", stale)
+                log.info("Cleaned up stale rows for: %s", ", ".join(stale))
+    except Exception as exc:
+        log.warning("cleanup_stale_containers: %s", exc)
 
 
 # ---------------------------------------------------------------------------
-# Settings (runtime config overrides stored in SQLite)
+# Settings (runtime overrides stored in SQLite)
 # ---------------------------------------------------------------------------
 
-_SETTING_DEFAULTS = {
-    "check_interval":  None,   # falls back to CHECK_INTERVAL env var
-    "allow_prerelease": None,  # falls back to ALLOW_PRERELEASE env var
-    "auto_update":     None,   # falls back to AUTO_UPDATE env var
-    "history_limit":   None,   # falls back to HISTORY_LIMIT env var
-}
-
-
-def get_setting(key: str):
-    """Return the DB-stored setting value, or None if not set."""
+def save_setting(key: str, value: str) -> bool:
     try:
-        conn = _get_conn()
-        c = conn.cursor()
-        c.execute("SELECT value FROM settings WHERE key=?", (key,))
-        row = c.fetchone()
-        conn.close()
-        return row[0] if row else None
-    except Exception:
-        return None
-
-
-def save_setting(key: str, value: str):
-    try:
-        conn = _get_conn()
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value))
-        conn.commit()
-        conn.close()
+        with _db() as conn:
+            conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value))
         return True
     except Exception as exc:
         log.error("save_setting %s: %s", key, exc)
@@ -934,16 +639,11 @@ def save_setting(key: str, value: str):
 
 
 def get_all_settings() -> dict:
-    """Return all current effective settings (DB override or env default).
-    Uses a single DB connection and one query for all keys.
-    """
     try:
-        conn = _get_conn()
-        c = conn.cursor()
-        c.execute("SELECT key, value FROM settings WHERE key IN (?,?,?,?)",
-                  ("check_interval", "allow_prerelease", "auto_update", "history_limit"))
-        overrides = {row[0]: row[1] for row in c.fetchall()}
-        conn.close()
+        with _db() as conn:
+            overrides = {r[0]: r[1] for r in conn.execute(
+                "SELECT key, value FROM settings WHERE key IN (?,?,?,?)",
+                ("check_interval", "allow_prerelease", "auto_update", "history_limit"))}
     except Exception:
         overrides = {}
 
@@ -952,9 +652,10 @@ def get_all_settings() -> dict:
         return (v == "true") if v is not None else default
 
     def _int(key, default):
-        v = overrides.get(key)
-        try: return int(v) if v is not None else default
-        except (ValueError, TypeError): return default
+        try:
+            return int(overrides[key]) if key in overrides else default
+        except (ValueError, TypeError):
+            return default
 
     return {
         "check_interval":   _int("check_interval", CHECK_INTERVAL),
@@ -964,33 +665,23 @@ def get_all_settings() -> dict:
     }
 
 
-def get_available_update(container: str):
-    try:
-        conn = _get_conn()
-        c = conn.cursor()
-        c.execute("SELECT available_tag FROM available_updates WHERE container=?", (container,))
-        row = c.fetchone()
-        if not row:
-            conn.close()
-            return None
-        tag = row[0]
-        # Validate cached tag against current filter — clears stale bad tags
-        # (e.g. pr-*, feature-* cached before the filter was tightened)
-        if not is_stable_tag(tag):
-            log.info("Clearing invalid cached tag %r for %s", tag, container)
-            c.execute("DELETE FROM available_updates WHERE container=?", (container,))
-            conn.commit()
-            conn.close()
-            return None
-        conn.close()
-        return tag
-    except Exception:
-        return None
-
-
 # ---------------------------------------------------------------------------
 # .env helpers
 # ---------------------------------------------------------------------------
+
+def _parse_env_value(raw: str) -> str:
+    value = raw.strip()
+    if value[:1] in ("'", '"'):
+        end = value.find(value[0], 1)
+        if end != -1:
+            return value[1:end]
+    # Strip an inline comment only when it is preceded by whitespace,
+    # so values like PASS=abc#def keep their '#'.
+    m = re.search(r"\s#", value)
+    if m:
+        value = value[:m.start()].rstrip()
+    return value
+
 
 def read_env() -> dict:
     env = {}
@@ -998,58 +689,88 @@ def read_env() -> dict:
         with open(ENV_FILE) as f:
             for line in f:
                 line = line.strip()
-                if "=" in line and not line.startswith("#"):
-                    k, v = line.split("=", 1)
-                    env[k.strip()] = v.strip()
-    except Exception as exc:
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):].lstrip()
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                env[k.strip()] = _parse_env_value(v)
+    except OSError as exc:
         log.error("read_env: %s", exc)
     return env
 
 
+_env_cache: dict = {}
+_env_cache_mtime: float = 0.0
+
+
+def read_env_cached() -> dict:
+    global _env_cache, _env_cache_mtime
+    try:
+        mtime = os.path.getmtime(ENV_FILE)
+        if mtime != _env_cache_mtime:
+            _env_cache = read_env()
+            _env_cache_mtime = mtime
+    except OSError:
+        pass
+    return _env_cache
+
+
 def write_env_var(var: str, value: str) -> bool:
     """
-    Update a variable in the .env file, preserving all other content.
-    Handles all common .env formats:
-      VAR=value
-      VAR = value      (spaces around =)
-      VAR=             (empty value)
-      export VAR=value (export prefix)
-    Write is atomic via a temp file + rename.
+    Set one variable in .env, keeping every other line (comments, export
+    prefixes) intact. The file is written in place because it is a single-file
+    bind mount, which cannot be atomically renamed. If the write fails midway,
+    the original content is written back.
     """
-    import re as _re
-    # Matches: optional 'export ', the var name, optional spaces, '=', anything
-    pattern = _re.compile(
-        r"^(export\s+)?" + _re.escape(var) + r"\s*=.*$"
-    )
+    if not ENV_VAR_RE.match(var) or not TAG_RE.match(value):
+        log.error("write_env_var: refusing unsafe name/value for %r", var)
+        return False
     try:
         with open(ENV_FILE) as f:
-            lines = f.readlines()
-        for i, line in enumerate(lines):
-            if pattern.match(line.rstrip("\n\r")):
-                # Preserve 'export ' prefix if present
-                prefix = "export " if line.lstrip().startswith("export ") else ""
-                lines[i] = f"{prefix}{var}={value}\n"
-                # Write directly — single-file bind mounts prevent atomic
-                # rename across overlay/host filesystem boundary (EXDEV).
-                # The file is small so direct write is safe here.
-                with open(ENV_FILE, "w") as f:
-                    f.writelines(lines)
-                log.debug("write_env_var: set %s=%s", var, value)
-                return True
-        log.warning("write_env_var: %s not found in %s — check the variable name matches exactly", var, ENV_FILE)
-        return False
-    except PermissionError:
-        log.error("write_env_var: no write permission on %s — check the volume is not mounted :ro", ENV_FILE)
+            original = f.read()
     except OSError as exc:
-        log.error("write_env_var: OS error writing %s: %s", ENV_FILE, exc)
-    except Exception as exc:
-        log.error("write_env_var: unexpected error: %s", exc)
-    return False
+        log.error("write_env_var: cannot read %s: %s", ENV_FILE, exc)
+        return False
+
+    lines = original.splitlines(keepends=True)
+    pattern = re.compile(r"^(export\s+)?" + re.escape(var) + r"\s*=")
+    idx = next((i for i, line in enumerate(lines) if pattern.match(line.lstrip())), None)
+    if idx is None:
+        log.warning("write_env_var: %s not found in %s", var, ENV_FILE)
+        return False
+
+    prefix = "export " if pattern.match(lines[idx].lstrip()).group(1) else ""
+    lines[idx] = f"{prefix}{var}={value}\n"
+    try:
+        with open(ENV_FILE, "w") as f:
+            f.writelines(lines)
+            f.flush()
+            os.fsync(f.fileno())
+        return True
+    except OSError as exc:
+        log.error("write_env_var: write failed, restoring original: %s", exc)
+        try:
+            with open(ENV_FILE, "w") as f:
+                f.write(original)
+        except OSError:
+            log.error("write_env_var: RESTORE ALSO FAILED for %s — check the file manually", ENV_FILE)
+        return False
 
 
 # ---------------------------------------------------------------------------
 # Compose file helpers
 # ---------------------------------------------------------------------------
+_INTERP_RE = re.compile(r"\$\{(\w+)(?::?-([^}]*))?\}")
+
+
+def _resolve_interp(text: str, env: dict) -> str:
+    def repl(m):
+        return env.get(m.group(1)) or (m.group(2) or "")
+    return _INTERP_RE.sub(repl, text or "")
+
 
 def read_compose(path: str):
     try:
@@ -1060,92 +781,76 @@ def read_compose(path: str):
         return None
 
 
-def get_compose_image_tag(compose_path: str, service_name: str):
-    """Read current image tag for a service from the compose file."""
+def _compose_tag(compose_path: str, service_name: str):
+    """Current tag for a compose service, with ${VAR} references resolved from .env."""
     data = read_compose(compose_path)
     if not data:
         return None
-    image = data.get("services", {}).get(service_name, {}).get("image", "")
-    return image.rsplit(":", 1)[1] if ":" in image else None
+    image = (data.get("services", {}).get(service_name, {}) or {}).get("image", "")
+    if not image:
+        return None
+    return _split_image(_resolve_interp(image, read_env_cached()))[1]
+
+
+_SERVICE_HEADER_CACHE: dict = {}
+
+
+def _locate_service_image(lines, service: str):
+    """Find the `image:` line belonging to a service, returning (index, match) or None."""
+    header = _SERVICE_HEADER_CACHE.get(service)
+    if header is None:
+        header = re.compile(r"^(\s*)" + re.escape(service) + r"\s*:\s*(#.*)?$")
+        _SERVICE_HEADER_CACHE[service] = header
+    image_re = re.compile(r"^(\s*)image\s*:\s*(['\"]?)([^'\"\s#]+)\2")
+
+    svc_indent = None
+    for i, line in enumerate(lines):
+        if svc_indent is None:
+            m = header.match(line.rstrip("\r\n"))
+            if m:
+                svc_indent = len(m.group(1))
+            continue
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip())
+        if stripped and not stripped.startswith("#") and indent <= svc_indent:
+            return None   # left the service block without an image line
+        if indent > svc_indent:
+            m = image_re.match(line)
+            if m:
+                return i, m
+    return None
 
 
 def set_compose_image_tag(compose_path: str, service_name: str, new_tag: str):
     """
-    Update a service's image tag in the compose file using line-by-line
-    regex replacement. This preserves comments, formatting, key order,
-    and quote styles — yaml.dump would destroy all of that.
-
-    Returns (success, old_tag).
+    Rewrite a service's image tag in place, changing only the tag characters.
+    Comments, quoting and indentation are untouched. Returns (ok, old_tag).
     """
-    import re as _re
     try:
         with open(compose_path) as f:
             lines = f.readlines()
-    except Exception as exc:
+    except OSError as exc:
         log.error("set_compose_image_tag read %s: %s", compose_path, exc)
         return False, ""
 
-    # First pass: find the service block and its indentation
-    svc_indent = None
-    in_service = False
-    for line in lines:
-        stripped = line.lstrip()
-        indent   = len(line) - len(stripped)
-        if stripped.startswith(f"{service_name}:"):
-            svc_indent = indent
-            in_service = True
-            continue
-        if in_service:
-            if stripped and indent <= svc_indent and not stripped.startswith("#"):
-                break   # left the service block
-            m = _re.match(r"(\s*image\s*:\s*)(.+)", line)
-            if m:
-                old_image = m.group(2).strip().strip("'\"")
-                base, old_tag = old_image.rsplit(":", 1) if ":" in old_image else (old_image, "latest")
-                break
-    else:
-        old_tag = "unknown"
-
-    if svc_indent is None:
-        log.error("set_compose_image_tag: service %r not found in %s", service_name, compose_path)
+    found = _locate_service_image(lines, service_name)
+    if not found:
+        log.error("set_compose_image_tag: no image line for %r in %s", service_name, compose_path)
+        return False, ""
+    idx, m = found
+    raw = m.group(3)
+    if "${" in raw:
+        log.error("set_compose_image_tag: %r uses a variable tag (%s) — use the env_file strategy", service_name, raw)
         return False, ""
 
-    # Second pass: rewrite the image line inside the service block
-    svc_indent   = None
-    in_service   = False
-    replaced     = False
-    new_lines    = []
-    for line in lines:
-        stripped = line.lstrip()
-        indent   = len(line) - len(stripped)
-        if stripped.startswith(f"{service_name}:"):
-            svc_indent = indent
-            in_service = True
-            new_lines.append(line)
-            continue
-        if in_service and not replaced:
-            if stripped and indent <= svc_indent and not stripped.startswith("#"):
-                in_service = False   # left the service block without finding image
-            else:
-                m = _re.match(r"(\s*image\s*:\s*)(.+)", line)
-                if m:
-                    old_image = m.group(2).strip().strip("'\"")
-                    base = old_image.rsplit(":", 1)[0] if ":" in old_image else old_image
-                    new_lines.append(f"{m.group(1)}{base}:{new_tag}\n")
-                    replaced = True
-                    continue
-        new_lines.append(line)
-
-    if not replaced:
-        log.error("set_compose_image_tag: image line not found for %r in %s", service_name, compose_path)
-        return False, old_tag
-
+    base, old_tag = _split_image(raw)
+    line = lines[idx]
+    lines[idx] = line[:m.start(3)] + f"{base}:{new_tag}" + line[m.end(3):]
     try:
         with open(compose_path, "w") as f:
-            f.writelines(new_lines)
-        log.debug("set_compose_image_tag: %s → %s:%s", service_name, base, new_tag)
+            f.writelines(lines)
         return True, old_tag
-    except Exception as exc:
+    except OSError as exc:
         log.error("set_compose_image_tag write %s: %s", compose_path, exc)
         return False, old_tag
 
@@ -1154,7 +859,7 @@ def run_compose_up(compose_path: str, service_name: str):
     try:
         result = subprocess.run(
             ["docker", "compose", "-f", compose_path, "up", "-d", "--no-deps", service_name],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, timeout=300,
         )
         if result.returncode == 0:
             return True, ""
@@ -1164,207 +869,377 @@ def run_compose_up(compose_path: str, service_name: str):
 
 
 # ---------------------------------------------------------------------------
-# Docker API recreate
+# Container replacement (docker_api and env_file strategies)
 # ---------------------------------------------------------------------------
 
-def get_image_parts(container_obj):
-    tags = container_obj.image.tags
-    if tags:
-        img = tags[0]
-        base, tag = img.rsplit(":", 1) if ":" in img else (img, "latest")
-        return base, tag
+def _stop_timeout(attrs: dict) -> int:
+    """Honour the container's own stop grace period (set by compose stop_grace_period)."""
+    t = (attrs.get("Config") or {}).get("StopTimeout")
     try:
-        repo_tags = container_obj.image.attrs.get("RepoTags", [])
-        if repo_tags:
-            img = repo_tags[0]
-            base, tag = img.rsplit(":", 1) if ":" in img else (img, "latest")
-            return base, tag
+        return int(t) if t else DEFAULT_STOP_TIMEOUT
+    except (TypeError, ValueError):
+        return DEFAULT_STOP_TIMEOUT
+
+
+def _health_timeout(attrs: dict) -> int:
+    """Wait at least as long as the container's own start_period, plus margin."""
+    hc = (attrs.get("Config") or {}).get("Healthcheck") or {}
+    start_period_s = int((hc.get("StartPeriod") or 0) / 1e9)
+    return max(HEALTH_TIMEOUT, start_period_s + 60)
+
+
+def _clean_aliases(net_data: dict) -> list:
+    # Docker adds 12-char container-id aliases automatically; those must not be re-sent
+    return [a for a in (net_data.get("Aliases") or []) if not re.match(r"^[0-9a-f]{12}$", a)]
+
+
+def _create_spec(attrs: dict, new_image: str, name: str):
+    """
+    Build create_container arguments from the old container's inspect data,
+    preserving config the old one had: healthcheck, log rotation, tmpfs, limits,
+    security options, DNS, stop timeout and network aliases.
+    Returns (spec, extra_networks) where extra_networks is [(name, aliases)].
+    """
+    cfg = attrs.get("Config") or {}
+    host = dict(attrs.get("HostConfig") or {})
+    host.pop("Links", None)
+    host["RestartPolicy"] = {"Name": "no"}   # enabled only after the health check passes
+
+    nets = (attrs.get("NetworkSettings") or {}).get("Networks") or {}
+    mode = host.get("NetworkMode") or "default"
+
+    primary = None
+    networking_config = None
+    if mode not in ("host", "none", "default") and not mode.startswith("container:") and mode in nets:
+        primary = mode
+        networking_config = {"EndpointsConfig": {primary: {"Aliases": _clean_aliases(nets[primary])}}}
+
+    extra = [
+        (n, _clean_aliases(d)) for n, d in nets.items()
+        if n != primary and n not in ("bridge", "host", "none")
+    ]
+
+    spec = {
+        "image": new_image,
+        "name": name,
+        "command": cfg.get("Cmd"),
+        "entrypoint": cfg.get("Entrypoint"),
+        "environment": cfg.get("Env"),
+        "user": cfg.get("User") or None,
+        "hostname": cfg.get("Hostname") or None,
+        "domainname": cfg.get("Domainname") or None,
+        "working_dir": cfg.get("WorkingDir") or None,
+        "labels": cfg.get("Labels") or None,
+        "tty": bool(cfg.get("Tty")),
+        "stdin_open": bool(cfg.get("OpenStdin")),
+        "stop_signal": cfg.get("StopSignal") or None,
+        "stop_timeout": _stop_timeout(attrs),
+        "healthcheck": cfg.get("Healthcheck") or None,
+        "ports": list((cfg.get("ExposedPorts") or {}).keys()) or None,
+        "host_config": host,
+        "networking_config": networking_config,
+    }
+    return spec, extra
+
+
+def _discard_new(client, name: str, jlog):
+    try:
+        client.containers.get(name).remove(force=True)
+    except dockerlib.errors.NotFound:
+        pass
+    except Exception as exc:
+        log.error("discard new container %s: %s", name, exc)
+
+
+def _restore_old(live, name: str, orig_restart: dict, jlog) -> bool:
+    try:
+        live.reload()
+        if live.name != name:
+            live.rename(name)
+        live.update(restart_policy=orig_restart)
+        live.start()
+        jlog(f"Restored previous container {name}", "warn")
+        return True
+    except Exception as exc:
+        log.error("CRITICAL: could not restore previous %s: %s", name, exc)
+        jlog(f"CRITICAL: could not restore previous {name}: {exc}", "error")
+        return False
+
+
+def _recover_leftover(client, name: str, jlog):
+    """
+    A previous run may have died mid-replacement and left {name}-dummy-old.
+    If nothing is running under the real name, the backup is the only copy:
+    rename it back and start it. If something is running under the real name,
+    the state is ambiguous, so refuse to guess and report it.
+    Returns an error string, or None if there is nothing to worry about.
+    """
+    backup = name + BACKUP_SUFFIX
+    try:
+        leftover = client.containers.get(backup)
+    except dockerlib.errors.NotFound:
+        return None
+    try:
+        client.containers.get(name)
+        return (f"Leftover backup {backup} exists alongside {name}, probably from an interrupted "
+                f"update. Resolve it manually (remove the backup if {name} is healthy).")
+    except dockerlib.errors.NotFound:
+        pass
+    try:
+        jlog(f"Recovering {name} from leftover backup {backup}", "warn")
+        leftover.rename(name)
+        leftover.update(restart_policy={"Name": "unless-stopped"})
+        leftover.start()
+        return None
+    except Exception as exc:
+        return f"Could not recover {name} from {backup}: {exc}"
+
+
+def check_container_health(container_name: str, timeout: int = None, jlog=None) -> bool:
+    """
+    Wait for a container to become healthy. Containers with a Docker healthcheck
+    must report 'healthy' (a start_period is tolerated). Containers without one
+    must stay running for STABLE_SECONDS without restarting. Any restart, exit,
+    or 'unhealthy' result fails immediately.
+    """
+    timeout = timeout or HEALTH_TIMEOUT
+
+    def _log(msg, level="info"):
+        if jlog:
+            jlog(msg, level)
+
+    try:
+        container = get_docker_client().containers.get(container_name)
+    except dockerlib.errors.NotFound:
+        _log(f"Container {container_name} not found after recreate", "error")
+        return False
+
+    start = time.time()
+    baseline_restarts = None
+    _log(f"Health check — waiting up to {timeout}s...")
+    while True:
+        try:
+            container.reload()
+        except Exception as exc:
+            _log(f"Health check error: {exc}", "error")
+            return False
+
+        attrs = container.attrs
+        state = attrs.get("State") or {}
+        has_hc = bool((attrs.get("Config") or {}).get("Healthcheck"))
+        restarts = attrs.get("RestartCount", 0)
+        if baseline_restarts is None:
+            baseline_restarts = restarts
+        elif restarts > baseline_restarts:
+            _log("Container restarted during health check ✗", "error")
+            return False
+
+        status = state.get("Status")
+        if status in ("exited", "dead"):
+            _log(f"Container {status} during health check ✗", "error")
+            return False
+
+        elapsed = time.time() - start
+        if status == "running":
+            health = (state.get("Health") or {}).get("Status")
+            if has_hc:
+                if health == "healthy":
+                    _log("Health check passed ✓")
+                    return True
+                if health == "unhealthy":
+                    _log("Container reports unhealthy ✗", "error")
+                    return False
+            elif elapsed >= STABLE_SECONDS:
+                _log(f"Running and stable for {STABLE_SECONDS}s ✓")
+                return True
+
+        if elapsed > timeout:
+            _log("Health check timed out ✗", "error")
+            return False
+        time.sleep(2)
+
+
+def replace_container(client, container_obj, new_image: str, jlog):
+    """
+    Replace a container with one running new_image, keeping the old one until
+    the new one is healthy. Returns (ok, message). The message says whether the
+    previous container was restored when a replacement fails.
+    """
+    try:
+        container_obj.reload()
     except Exception:
         pass
-    return "unknown", "unknown"
+    name = container_obj.name
+    attrs = container_obj.attrs
+    backup = name + BACKUP_SUFFIX
+    orig_restart = (attrs.get("HostConfig") or {}).get("RestartPolicy") or {"Name": "unless-stopped"}
 
+    leftover_err = _recover_leftover(client, name, jlog)
+    if leftover_err:
+        return False, leftover_err
 
-def _convert_healthcheck(hc: dict):
-    """
-    Convert a container's raw Config.Healthcheck (Docker Engine API format,
-    CapitalizedKeys, durations in nanoseconds) into the snake_case dict that
-    docker-py's containers.create(healthcheck=...) expects.
-    Returns None if no healthcheck override is set (image default applies).
-    """
-    if not hc or not hc.get("Test"):
-        return None
-    return {
-        "test":         hc.get("Test"),
-        "interval":     hc.get("Interval", 0),
-        "timeout":      hc.get("Timeout", 0),
-        "retries":      hc.get("Retries", 0),
-        "start_period": hc.get("StartPeriod", 0),
-    }
-
-
-def _convert_ulimits(raw_ulimits: list):
-    """Convert raw HostConfig.Ulimits dicts into docker-py Ulimit objects."""
-    if not raw_ulimits:
-        return None
-    out = []
-    for u in raw_ulimits:
-        try:
-            out.append(dockerlib.types.Ulimit(name=u["Name"], soft=u["Soft"], hard=u["Hard"]))
-        except Exception:
-            continue
-    return out or None
-
-
-def recreate_container(client, container_obj, new_image: str, jlog=None):
-    """Pull new_image, stop+remove old container, recreate with same config."""
-    def _log(msg):
-        log.info(msg)
-        if jlog:
-            jlog(msg)
-
-    name     = container_obj.name
-    attrs    = container_obj.attrs
-    host_cfg = attrs.get("HostConfig", {})
-    net_cfg  = attrs.get("NetworkSettings", {}).get("Networks", {})
-    cfg      = attrs.get("Config", {})
-
-    # Preserve the container's configured stop timeout / grace period
-    # (compose's `stop_grace_period`). Falls back to 30s if unset.
-    stop_timeout = host_cfg.get("StopTimeout")
-    if not stop_timeout or stop_timeout <= 0:
-        stop_timeout = 30
-
-    create_kwargs = {
-        "name":           name,
-        "image":          new_image,
-        "environment":    cfg.get("Env") or [],
-        "volumes":        host_cfg.get("Binds") or [],
-        "labels":         cfg.get("Labels") or {},
-        "restart_policy": host_cfg.get("RestartPolicy") or {"Name": "unless-stopped"},
-        "network_mode":   host_cfg.get("NetworkMode", "bridge"),
-        "hostname":       cfg.get("Hostname"),
-        "entrypoint":     cfg.get("Entrypoint"),
-        "command":        cfg.get("Cmd"),
-        "working_dir":    cfg.get("WorkingDir"),
-        "user":           cfg.get("User"),
-        "tty":            cfg.get("Tty", False),
-        "stdin_open":     cfg.get("OpenStdin", False),
-        "cap_add":        host_cfg.get("CapAdd"),
-        "cap_drop":       host_cfg.get("CapDrop"),
-        "devices":        host_cfg.get("Devices"),
-        "privileged":     host_cfg.get("Privileged", False),
-        "shm_size":       host_cfg.get("ShmSize"),
-        "pid_mode":       host_cfg.get("PidMode"),
-        "ports":          host_cfg.get("PortBindings") or {},
-        # --- previously dropped on recreate ---
-        "tmpfs":          host_cfg.get("Tmpfs") or {},
-        "dns":            host_cfg.get("Dns") or [],
-        "dns_search":     host_cfg.get("DnsSearch") or [],
-        "sysctls":        host_cfg.get("Sysctls") or {},
-        "security_opt":   host_cfg.get("SecurityOpt") or [],
-        "ulimits":        _convert_ulimits(host_cfg.get("Ulimits")),
-        "stop_signal":    cfg.get("StopSignal"),
-        "healthcheck":    _convert_healthcheck(cfg.get("Healthcheck")),
-        # NOTE: intentionally NOT setting "stop_timeout" here. docker-py's
-        # high-level containers.create() does not support it — it's a
-        # long-standing, unresolved upstream limitation (docker/docker-py#3168),
-        # confirmed the hard way (this crashed ntfy's recreate in production).
-        # The low-level client.api.create_container() does accept it, but
-        # switching this whole function to the low-level API risks subtly
-        # breaking port bindings / healthcheck formatting in ways that can't
-        # be verified without a live daemon, so it's not worth the risk here.
-        #
-        # Practical effect: `stop_timeout` (below) is still fully honored for
-        # every stop DUMMY itself performs (see container_obj.stop() call),
-        # which is what actually protects a slow-shutdown container like
-        # qBittorrent during a DUMMY-driven update. What's NOT preserved is
-        # the value baked into the new container's own Docker config, so a
-        # `docker stop`/`docker compose down` run by something other than
-        # DUMMY will fall back to Docker's default (10s) after a DUMMY
-        # recreate. If a container needs stop_grace_period honored outside
-        # of DUMMY too, use the compose-file strategy for it instead —
-        # `docker compose up` sets this correctly because it talks to Docker
-        # directly, not through this code path.
-    }
-    create_kwargs = {k: v for k, v in create_kwargs.items() if v is not None and v != {} and v != []}
-
-    _log(f"Pulling {new_image}...")
+    jlog(f"Pulling {new_image}...")
     try:
         client.images.pull(new_image)
     except Exception as exc:
         return False, f"Pull failed: {exc}"
 
-    _log(f"Stopping {name}...")
+    live = None
     try:
-        container_obj.stop(timeout=stop_timeout)
-        _log(f"Removing {name}...")
-        container_obj.remove()
-    except Exception as exc:
-        return False, f"Stop/remove failed: {exc}"
+        live = client.containers.get(name)
+    except dockerlib.errors.NotFound:
+        pass
 
-    _log(f"Recreating {name}...")
+    if live is not None:
+        try:
+            jlog(f"Stopping {name} (grace {_stop_timeout(attrs)}s)...")
+            live.stop(timeout=_stop_timeout(attrs))
+            jlog(f"Keeping previous container as {backup} until the new one is healthy")
+            live.rename(backup)
+            live.update(restart_policy={"Name": "no"})
+        except Exception as exc:
+            restored = _restore_old(live, name, orig_restart, jlog) if live else False
+            note = "previous container restored" if restored else "WARNING: previous container could not be restored"
+            return False, f"Stop failed: {exc} ({note})"
+
+    def _rollback_to_old(reason: str):
+        _discard_new(client, name, jlog)
+        if live is None:
+            return False, f"{reason} (no previous container existed)"
+        restored = _restore_old(live, name, orig_restart, jlog)
+        note = "previous container restored" if restored else "WARNING: previous container could not be restored"
+        return False, f"{reason} ({note})"
+
+    spec, extra_networks = _create_spec(attrs, new_image, name)
     try:
-        new_container = client.containers.create(**create_kwargs)
-        default_net = create_kwargs.get("network_mode", "bridge")
-        for net_name, net_data in net_cfg.items():
-            if net_name == default_net:
-                continue
+        jlog(f"Creating {name} with {new_image}...")
+        created = client.api.create_container(**spec)
+        for net_name, aliases in extra_networks:
             try:
-                network = client.networks.get(net_name)
-                aliases = [a for a in (net_data.get("Aliases") or []) if not re.match(r"^[0-9a-f]{12}$", a)]
-                network.connect(new_container, aliases=aliases or None)
-                _log(f"Attached to network: {net_name}")
+                client.networks.get(net_name).connect(created["Id"], aliases=aliases or None)
+                jlog(f"Attached to network: {net_name}")
             except Exception as exc:
                 log.warning("Could not attach %s to %s: %s", name, net_name, exc)
-        _log(f"Starting {name}...")
-        new_container.start()
-        return True, ""
+        new = client.containers.get(created["Id"])
+        jlog(f"Starting {name}...")
+        new.start()
     except Exception as exc:
-        return False, f"Recreate failed: {exc}"
+        return _rollback_to_old(f"Recreate failed: {exc}")
+
+    if not check_container_health(name, timeout=_health_timeout(attrs), jlog=jlog):
+        return _rollback_to_old("Health check failed")
+
+    try:
+        new.reload()
+        new.update(restart_policy=orig_restart)
+    except Exception as exc:
+        jlog(f"Could not restore restart policy on {name}: {exc}", "warn")
+
+    if live is not None:
+        try:
+            live.remove(force=True)
+            jlog(f"Removed previous container {backup}")
+        except Exception as exc:
+            jlog(f"Could not remove {backup}: {exc}", "warn")
+    return True, ""
 
 
 # ---------------------------------------------------------------------------
-# Health check
+# Strategy resolution, labels, monitoring
 # ---------------------------------------------------------------------------
 
-def check_container_health(container_name: str, timeout: int = None, jlog=None) -> bool:
-    timeout = timeout or HEALTH_TIMEOUT
-    if jlog:
-        jlog(f"Health check — waiting up to {timeout}s...")
+def _get_dummy_labels(container_obj) -> dict:
+    labels = (container_obj.attrs.get("Config") or {}).get("Labels") or {}
+    return {k[len("dummy."):]: v for k, v in labels.items() if k.startswith("dummy.")}
+
+
+def _is_monitored(container_obj) -> bool:
+    return _get_dummy_labels(container_obj).get("enable", "").lower() == "true" \
+        or container_obj.name in VERSION_MAP
+
+
+def _resolve_strategy(container_name: str, dummy_labels: dict) -> dict:
+    compose_file = dummy_labels.get("compose_file")
+    env_var = dummy_labels.get("env_var") or VERSION_MAP.get(container_name)
+    compose_svc = dummy_labels.get("compose_service", container_name)
+    if compose_file:
+        return {"strategy": STRATEGY_COMPOSE, "compose_file": compose_file, "compose_svc": compose_svc}
+    if env_var:
+        return {"strategy": STRATEGY_ENV_FILE, "env_var": env_var}
+    return {"strategy": STRATEGY_DOCKER_API}
+
+
+def get_image_parts(container_obj):
+    """Image base and tag from the reference the container was created with."""
+    ref = (container_obj.attrs.get("Config") or {}).get("Image") or ""
+    if not ref:
+        return "unknown", "unknown"
+    return _split_image(ref)
+
+
+def _effective_current(strategy_cfg: dict, run_tag: str, env_vars: dict) -> str:
+    """The version DUMMY considers 'current' for a container: .env / compose file / running image."""
+    if strategy_cfg["strategy"] == STRATEGY_ENV_FILE:
+        return env_vars.get(strategy_cfg["env_var"], run_tag)
+    if strategy_cfg["strategy"] == STRATEGY_COMPOSE:
+        return _compose_tag(strategy_cfg["compose_file"], strategy_cfg["compose_svc"]) or run_tag
+    return run_tag
+
+
+def get_monitored_containers() -> list:
+    items = []
     try:
         client = get_docker_client()
-        # Retry the initial containers.get() — Docker may not have registered
-        # the new container immediately after recreate_container returns.
-        container = None
-        for _attempt in range(6):
-            try:
-                container = client.containers.get(container_name)
-                break
-            except dockerlib.errors.NotFound:
-                if _attempt < 5:
-                    time.sleep(1)
-        if container is None:
-            if jlog:
-                jlog(f"Container {container_name} not found after recreate", "error")
-            return False
-        deadline  = time.time() + timeout
-        while time.time() < deadline:
-            container.reload()
-            if container.status == "running":
-                health = container.attrs.get("State", {}).get("Health", {})
-                if not health or health.get("Status") == "healthy":
-                    if jlog:
-                        jlog("Health check passed ✓")
-                    return True
-            time.sleep(2)
-        if jlog:
-            jlog("Health check timed out ✗", "error")
-        return False
+        env_vars = read_env_cached()
+
+        candidates = []
+        # all=True so stopped monitored containers still show on the dashboard
+        for c in client.containers.list(all=True):
+            if _is_monitored(c):
+                candidates.append((c, _get_dummy_labels(c)))
+        if not candidates:
+            return []
+
+        db_data = _fetch_container_data_bulk([c.name for c, _ in candidates])
+
+        for c, dummy_labels in candidates:
+            image, run_tag = get_image_parts(c)
+            cfg = _resolve_strategy(c.name, dummy_labels)
+            pinned = dummy_labels.get("pin", "").lower() == "true"
+            current = _effective_current(cfg, run_tag, env_vars)
+            drift = current != run_tag and cfg["strategy"] != STRATEGY_DOCKER_API
+
+            d = db_data.get(c.name, {})
+            available = None if pinned else d.get("available_tag")
+            if available and available in d.get("dismissed_tags", set()):
+                available = None
+            # Config says one version but the container runs another: offer to reconcile
+            if drift and not pinned and not available:
+                available = current
+            has_update = bool(available) and not pinned and available != run_tag
+
+            items.append({
+                "container": c.name,
+                "image": image,
+                "current_tag": current,
+                "running_tag": run_tag,
+                "drift": drift,
+                "available_tag": available,
+                "has_update": has_update,
+                "pinned": pinned,
+                "status": c.status,
+                "strategy": cfg["strategy"],
+                "strategy_label": STRATEGY_LABELS[cfg["strategy"]],
+                "changelog": get_changelog(image, dummy_labels.get("changelog")),
+                "history": d.get("history", []),
+                "dismissed": d.get("dismissed", []),
+                "checked_at": d.get("checked_at", ""),
+                "_strategy_cfg": cfg,
+            })
     except Exception as exc:
-        log.error("check_container_health %s: %s", container_name, exc)
-        if jlog:
-            jlog(f"Health check error: {exc}", "error")
-        return False
+        log.error("get_monitored_containers: %s", exc)
+
+    return sorted(items, key=lambda x: (not x["has_update"], x["container"]))
 
 
 # ---------------------------------------------------------------------------
@@ -1380,202 +1255,171 @@ def notify(title: str, body: str, priority: str = "3", tags: str = "package"):
     if NTFY_CLICK_URL:
         headers["Click"] = NTFY_CLICK_URL
     try:
-        req.post(f"{NTFY_ENDPOINT}/{NTFY_TOPIC}", data=body.encode("utf-8"), headers=headers, timeout=5)
+        _session.post(f"{NTFY_ENDPOINT}/{NTFY_TOPIC}", data=body.encode("utf-8"), headers=headers, timeout=5)
     except Exception as exc:
         log.warning("notify failed: %s", exc)
 
 
-# ---------------------------------------------------------------------------
-# Container discovery & strategy resolution
-# ---------------------------------------------------------------------------
-
-def _get_dummy_labels(container_obj) -> dict:
-    labels = container_obj.attrs.get("Config", {}).get("Labels") or {}
-    return {k[len("dummy."):]: v for k, v in labels.items() if k.startswith("dummy.")}
-
-
-def _resolve_strategy(container_name: str, dummy_labels: dict) -> dict:
-    compose_file = dummy_labels.get("compose_file")
-    env_var      = dummy_labels.get("env_var") or VERSION_MAP.get(container_name)
-    compose_svc  = dummy_labels.get("compose_service", container_name)
-
-    if compose_file:
-        return {"strategy": STRATEGY_COMPOSE, "compose_file": compose_file, "compose_svc": compose_svc}
-    if env_var:
-        return {"strategy": STRATEGY_ENV_FILE, "env_var": env_var}
-    return {"strategy": STRATEGY_DOCKER_API}
-
-
-def _fetch_container_data_bulk(container_names: list) -> dict:
-    """
-    Single DB round-trip to load available_updates, version_history, and
-    dismissed_updates for all monitored containers at once.
-    Returns a dict keyed by container name.
-    """
-    if not container_names:
-        return {}
+def send_webhook(event: str, data: dict):
+    if not WEBHOOK_URL:
+        return
+    payload = {"event": event, "timestamp": datetime.now().isoformat(), **data}
     try:
-        limit = get_all_settings()["history_limit"]
-        placeholders = ",".join("?" * len(container_names))
-        conn = _get_conn()
-        c = conn.cursor()
-
-        # available_updates
-        c.execute(f"SELECT container, available_tag, checked_at FROM available_updates "
-                  f"WHERE container IN ({placeholders})", container_names)
-        avail = {row[0]: (row[1], row[2]) for row in c.fetchall()}
-
-        # version_history — fetch all rows then trim per container in Python
-        c.execute(f"SELECT container, tag, deployed_at, status FROM version_history "
-                  f"WHERE container IN ({placeholders}) ORDER BY deployed_at DESC",
-                  container_names)
-        hist_raw: dict = {}
-        for row in c.fetchall():
-            hist_raw.setdefault(row[0], []).append(
-                {"tag": row[1], "date": row[2], "status": row[3]}
-            )
-        history = {k: v[:limit] for k, v in hist_raw.items()}
-
-        # dismissed_updates
-        c.execute(f"SELECT container, tag, dismissed_at FROM dismissed_updates "
-                  f"WHERE container IN ({placeholders}) ORDER BY dismissed_at DESC",
-                  container_names)
-        dismissed: dict = {}
-        for row in c.fetchall():
-            dismissed.setdefault(row[0], []).append(
-                {"tag": row[1], "dismissed_at": row[2]}
-            )
-
-        conn.close()
-        result = {}
-        for name in container_names:
-            av_tag, checked_at = avail.get(name, (None, ""))
-            dismissed_tags = {d["tag"] for d in dismissed.get(name, [])}
-            # Validate cached tag still passes filter
-            if av_tag and not is_stable_tag(av_tag):
-                av_tag = None
-            result[name] = {
-                "available_tag": av_tag,
-                "checked_at":    checked_at or "",
-                "history":       history.get(name, []),
-                "dismissed":     dismissed.get(name, []),
-                "dismissed_tags": dismissed_tags,
-            }
-        return result
+        resp = _session.post(WEBHOOK_URL, json=payload, timeout=10)
+        if resp.status_code >= 400:
+            log.warning("Webhook %s returned HTTP %s", event, resp.status_code)
     except Exception as exc:
-        log.error("_fetch_container_data_bulk: %s", exc)
-        return {}
+        log.warning("Webhook failed (%s): %s", event, exc)
 
 
-# .env cache — avoid re-reading from disk on every page load
-_env_cache: dict = {}
-_env_cache_mtime: float = 0.0
-
-def read_env_cached() -> dict:
-    """Return .env contents, re-reading only when the file has changed."""
-    global _env_cache, _env_cache_mtime
-    try:
-        mtime = os.path.getmtime(ENV_FILE)
-        if mtime != _env_cache_mtime:
-            _env_cache = read_env()
-            _env_cache_mtime = mtime
-    except OSError:
-        pass   # file missing — return whatever we have
-    return _env_cache
+def _announce_success(container: str, old_tag: str, new_tag: str, status: str, updated: list):
+    notify(f"Updated: {container}", f"{container}: {old_tag} → {new_tag}", tags="white_check_mark")
+    send_webhook("update_success", {"container": container, "from_tag": old_tag, "to_tag": new_tag,
+                                    "status": status, "containers_updated": updated})
 
 
-def get_monitored_containers() -> list:
-    items = []
-    try:
-        client   = get_docker_client()
-        env_vars = read_env_cached()
+def _announce_failure(container: str, attempted: str, reason: str):
+    notify(f"Update Failed: {container}", f"{container} → {attempted}: {reason}", priority="4", tags="warning")
+    send_webhook("update_failed", {"container": container, "attempted_tag": attempted, "reason": reason})
 
-        # Collect all monitored containers first (no DB yet)
-        candidates = []
-        for c in client.containers.list():
-            dummy_labels   = _get_dummy_labels(c)
-            in_version_map = c.name in VERSION_MAP
-            if dummy_labels.get("enable", "").lower() != "true" and not in_version_map:
-                continue
-            candidates.append((c, dummy_labels))
 
-        if not candidates:
-            return []
-
-        # Single DB round-trip for all container data
-        names    = [c.name for c, _ in candidates]
-        db_data  = _fetch_container_data_bulk(names)
-
-        for c, dummy_labels in candidates:
-            image, tag   = get_image_parts(c)
-            strategy_cfg = _resolve_strategy(c.name, dummy_labels)
-            strategy     = strategy_cfg["strategy"]
-            pinned       = dummy_labels.get("pin", "").lower() == "true"
-
-            if strategy == STRATEGY_ENV_FILE:
-                # The running container is the real source of truth — Docker API
-                # recreate never reads .env, so .env can drift from what's
-                # actually deployed (e.g. an update/rollback job interrupted
-                # mid-flight). Use the live container tag for display, and just
-                # log if .env disagrees so drift doesn't go unnoticed.
-                current_tag = tag
-                env_tag = env_vars.get(strategy_cfg["env_var"])
-                if env_tag and env_tag != tag:
-                    log.warning(
-                        "%s: .env %s=%s does not match running container tag %s "
-                        "(likely an interrupted update/rollback) — using the "
-                        "container's live tag for display",
-                        c.name, strategy_cfg["env_var"], env_tag, tag
-                    )
-            elif strategy == STRATEGY_COMPOSE:
-                current_tag = get_compose_image_tag(strategy_cfg["compose_file"], strategy_cfg["compose_svc"]) or tag
-            else:
-                current_tag = tag
-
-            d             = db_data.get(c.name, {})
-            available_tag = d.get("available_tag") if not pinned else None
-            dismissed_tags= d.get("dismissed_tags", set())
-
-            # Suppress dismissed available tag from display
-            if available_tag and available_tag in dismissed_tags:
-                available_tag = None
-
-            has_update = bool(
-                available_tag
-                and available_tag != current_tag
-                and not pinned
-            )
-
-            items.append({
-                "container":      c.name,
-                "image":          image,
-                "current_tag":    current_tag,
-                "available_tag":  available_tag,
-                "has_update":     has_update,
-                "pinned":         pinned,
-                "status":         c.status,
-                "strategy":       strategy,
-                "strategy_label": STRATEGY_LABELS[strategy],
-                "changelog":      get_changelog(image, dummy_labels.get("changelog")),
-                "history":        d.get("history", []),
-                "dismissed":      d.get("dismissed", []),
-                "checked_at":     d.get("checked_at", ""),
-                "_strategy_cfg":  strategy_cfg,
-            })
-
-    except Exception as exc:
-        log.error("get_monitored_containers: %s", exc)
-
-    return sorted(items, key=lambda x: (not x["has_update"], x["container"]))
+def _record_success(name: str, old_tag: str, new_tag: str, status: str):
+    if old_tag and old_tag != new_tag:
+        add_to_history(name, old_tag, "previous")
+    add_to_history(name, new_tag, status)
+    clear_available_update(name)
 
 
 # ---------------------------------------------------------------------------
 # Update / rollback
 # ---------------------------------------------------------------------------
 
-def update_service(container: str, new_tag: str, job_id: str = None, history_status: str = "deployed") -> dict:
+def _update_docker_api(client, obj, container, image, run_tag, new_tag, jl, status) -> dict:
+    if run_tag == new_tag:
+        return {"success": True, "message": f"Already on {new_tag}", "updated": []}
+    ok, msg = replace_container(client, obj, f"{image}:{new_tag}", jl)
+    if not ok:
+        _announce_failure(container, new_tag, msg)
+        return {"success": False, "error": msg}
+    _record_success(container, run_tag, new_tag, status)
+    _announce_success(container, run_tag, new_tag, status, [container])
+    return {"success": True, "message": f"Updated to {new_tag}", "updated": [container]}
+
+
+def _update_env_file(client, obj, container, image, run_tag, cfg, new_tag, jl, status, env_monitored) -> dict:
+    var = cfg["env_var"]
+    env_current = read_env().get(var, "unknown")
+    jl(f"Running:    {run_tag}")
+    jl(f".env:      {env_current}  ({var})")
+
+    if run_tag == new_tag and env_current == new_tag:
+        return {"success": True, "message": f"Already on {new_tag}", "updated": []}
+
+    # Peers share this variable (e.g. immich_server and immich_machine_learning)
+    peers = [p for p in env_monitored
+             if p["container"] != container and p["_strategy_cfg"].get("env_var") == var]
+    if peers:
+        jl(f"Peers sharing {var}: {', '.join(p['container'] for p in peers)}")
+
+    if env_current != new_tag:
+        jl(f"Writing {var}={new_tag} to .env...")
+        if not write_env_var(var, new_tag):
+            return {"success": False, "error": f"Failed to write {var} to {ENV_FILE}"}
+
+    updated, failures = [], []
+
+    if run_tag != new_tag:
+        ok, msg = replace_container(client, obj, f"{image}:{new_tag}", jl)
+        if not ok:
+            if env_current != new_tag:
+                write_env_var(var, env_current)
+                msg += " — .env reverted"
+            _announce_failure(container, new_tag, msg)
+            return {"success": False, "error": msg}
+        _record_success(container, run_tag, new_tag, status)
+        updated.append(container)
+
+    for peer in peers:
+        pname = peer["container"]
+        if peer["running_tag"] == new_tag:
+            continue
+        try:
+            peer_obj = client.containers.get(pname)
+        except dockerlib.errors.NotFound:
+            failures.append(f"{pname}: not found")
+            continue
+        jl(f"Replacing peer {pname} with {peer['image']}:{new_tag}...")
+        ok, msg = replace_container(client, peer_obj, f"{peer['image']}:{new_tag}", jl)
+        if ok:
+            _record_success(pname, peer["running_tag"], new_tag, status)
+            updated.append(pname)
+        else:
+            failures.append(f"{pname}: {msg}")
+
+    if failures:
+        # .env already points at new_tag, so the failed peers will show as drift
+        # on the dashboard until they are reconciled.
+        reason = "; ".join(failures)
+        _announce_failure(container, new_tag, f"peer failures: {reason}")
+        return {"success": False, "error": f"Peer failures: {reason}", "updated": updated}
+
+    _announce_success(container, run_tag, new_tag, status, updated)
+    return {"success": True, "message": f"Updated to {new_tag}" +
+            (f" ({len(updated)} containers)" if len(updated) > 1 else ""), "updated": updated}
+
+
+def _update_compose(obj, container, cfg, new_tag, jl, status) -> dict:
+    compose_file, svc = cfg["compose_file"], cfg["compose_svc"]
+    current = _compose_tag(compose_file, svc) or "unknown"
+    jl(f"Current:    {current}")
+    if current == new_tag:
+        return {"success": True, "message": f"Already on {new_tag}", "updated": []}
+
+    try:
+        with open(compose_file) as f:
+            snapshot = f.readlines()
+    except OSError as exc:
+        return {"success": False, "error": f"Cannot read {compose_file}: {exc}"}
+
+    jl(f"Editing image tag in {compose_file}...")
+    ok, _ = set_compose_image_tag(compose_file, svc, new_tag)
+    if not ok:
+        return {"success": False, "error": f"Failed to edit {compose_file}"}
+
+    def _restore_file():
+        try:
+            with open(compose_file, "w") as f:
+                f.writelines(snapshot)
+        except OSError as exc:
+            log.error("CRITICAL: could not restore %s: %s", compose_file, exc)
+
+    jl(f"Running: docker compose up -d {svc}")
+    ok, err = run_compose_up(compose_file, svc)
+    if not ok:
+        jl("Restoring compose file from snapshot...", "warn")
+        _restore_file()
+        _announce_failure(container, new_tag, f"compose up failed: {err}")
+        return {"success": False, "error": f"docker compose up failed: {err}"}
+
+    if not check_container_health(container, timeout=_health_timeout(obj.attrs), jlog=jl):
+        jl("Rolling back compose file and redeploying previous version...", "warn")
+        _restore_file()
+        run_compose_up(compose_file, svc)
+        _announce_failure(container, new_tag, f"health check failed, rolled back to {current}")
+        return {"success": False, "error": "Health check failed — auto-rolled back"}
+
+    _record_success(container, current, new_tag, status)
+    _announce_success(container, current, new_tag, status, [container])
+    return {"success": True, "message": f"Updated to {new_tag}", "updated": [container]}
+
+
+def update_service(container: str, new_tag: str, job_id: str = None,
+                   history_status: str = "deployed") -> dict:
     def jl(msg, level="info"):
         _jlog(job_id, msg, level)
+
+    if not NAME_RE.match(container or "") or not TAG_RE.match(new_tag or ""):
+        return {"success": False, "error": "Invalid container name or tag"}
 
     with _active_lock:
         if container in _active_containers:
@@ -1583,208 +1427,35 @@ def update_service(container: str, new_tag: str, job_id: str = None, history_sta
         _active_containers.add(container)
 
     try:
-        client        = get_docker_client()
-        container_obj = client.containers.get(container)
-        image, _      = get_image_parts(container_obj)
-        dummy_labels  = _get_dummy_labels(container_obj)
-        strategy_cfg  = _resolve_strategy(container, dummy_labels)
-        strategy      = strategy_cfg["strategy"]
+        client = get_docker_client()
+        try:
+            obj = client.containers.get(container)
+        except dockerlib.errors.NotFound:
+            return {"success": False, "error": f"Container {container} not found"}
+        if not _is_monitored(obj):
+            return {"success": False, "error": f"{container} is not monitored by DUMMY"}
 
+        image, run_tag = get_image_parts(obj)
         if image == "unknown":
             return {"success": False, "error": "Cannot determine image name"}
+        cfg = _resolve_strategy(container, _get_dummy_labels(obj))
+        strategy = cfg["strategy"]
 
         jl(f"Container:  {container}")
         jl(f"Strategy:   {STRATEGY_LABELS[strategy]}")
         jl(f"Target tag: {new_tag}")
 
-        # ── ENV FILE ──────────────────────────────────────────────────────
         if strategy == STRATEGY_ENV_FILE:
-            var         = strategy_cfg["env_var"]
-            current_tag = read_env().get(var, "unknown")
-            jl(f"Current:    {current_tag}  ({var})")
-            add_to_history(container, current_tag, status="previous")
-            _job_begin(container, job_id or "auto", strategy, current_tag, new_tag)
-
-            jl(f"Writing {var}={new_tag} to .env...")
-            if not write_env_var(var, new_tag):
-                return {"success": False, "error": f"Failed to write {var} to {ENV_FILE} — check DUMMY logs for details (common cause: volume mounted :ro)"}
-            _job_step(container, "env_written")
-
-            # Find all OTHER monitored containers that share the same env var
-            # (e.g. immich_server and immich_machine_learning both use IMMICH_VER)
-            # so they can be updated in the same operation.
-            all_monitored = get_monitored_containers()
-            peers = [
-                c for c in all_monitored
-                if c["container"] != container
-                and c["_strategy_cfg"].get("env_var") == var
-            ]
-            if peers:
-                peer_names = [p["container"] for p in peers]
-                jl(f"Found {len(peers)} peer container(s) sharing {var}: {', '.join(peer_names)}")
-
-            # Recreate primary container
-            jl(f"Recreating {container} with {image}:{new_tag}...")
-            ok, err = recreate_container(
-                client, container_obj, f"{image}:{new_tag}",
-                jlog=lambda m: jl(m)
-            )
-            if not ok:
-                write_env_var(var, current_tag)
-                return {"success": False, "error": err}
-            _job_step(container, "recreated")
-
-            if not check_container_health(container, jlog=jl):
-                jl(f"Rolling back — restoring {var}={current_tag}", "warn")
-                write_env_var(var, current_tag)
-                try:
-                    failed_obj = get_docker_client().containers.get(container)
-                    recreate_container(client, failed_obj, f"{image}:{current_tag}",
-                                       jlog=lambda m: jl(m))
-                except Exception:
-                    pass
-                check_container_health(container, timeout=30)
-                notify(f"Update Failed: {container}", f"Rolled back to {current_tag}", priority="4", tags="warning")
-                send_webhook("update_failed", {"container": container, "attempted_tag": new_tag, "rolled_back_to": current_tag})
-                return {"success": False, "error": "Health check failed — auto-rolled back"}
-
-            _job_step(container, "healthy")
-            add_to_history(container, new_tag, status=history_status)
-            clear_available_update(container)
-
-            # Recreate peer containers sharing the same env var
-            peer_failures = []
-            for peer in peers:
-                peer_name  = peer["container"]
-                peer_image = peer["image"]
-                jl(f"Recreating peer {peer_name} with {peer_image}:{new_tag}...")
-                try:
-                    peer_obj = client.containers.get(peer_name)
-                    add_to_history(peer_name, peer["current_tag"], status="previous")
-                    p_ok, p_err = recreate_container(
-                        client, peer_obj, f"{peer_image}:{new_tag}",
-                        jlog=lambda m: jl(m)
-                    )
-                    if p_ok and check_container_health(peer_name, jlog=jl):
-                        add_to_history(peer_name, new_tag, status=history_status)
-                        clear_available_update(peer_name)
-                        jl(f"Peer {peer_name} updated ✓")
-                    else:
-                        jl(f"Peer {peer_name} failed: {p_err}", "warn")
-                        peer_failures.append(peer_name)
-                except Exception as exc:
-                    jl(f"Peer {peer_name} error: {exc}", "error")
-                    log.error("peer update %s: %s", peer_name, exc, exc_info=True)
-                    peer_failures.append(peer_name)
-
-            all_updated = [container] + [p["container"] for p in peers if p["container"] not in peer_failures]
-            summary = f"Updated to {new_tag}" + (f" ({len(all_updated)} containers)" if peers else "")
-            if peer_failures:
-                summary += f" — peer failures: {', '.join(peer_failures)}"
-
-            jl(f"Done! {current_tag} → {new_tag}")
-            notify(f"Updated: {container}", f"{container}: {current_tag} → {new_tag}", tags="white_check_mark")
-            send_webhook("update_success", {"container": container, "from_tag": current_tag, "to_tag": new_tag,
-                         "status": history_status, "peers_updated": all_updated})
-            return {"success": True, "message": summary}
-
-        # ── COMPOSE FILE ──────────────────────────────────────────────────
-        elif strategy == STRATEGY_COMPOSE:
-            compose_file = strategy_cfg["compose_file"]
-            compose_svc  = strategy_cfg["compose_svc"]
-            current_tag  = get_compose_image_tag(compose_file, compose_svc) or "unknown"
-            jl(f"Current:    {current_tag}")
-            add_to_history(container, current_tag, status="previous")
-            _job_begin(container, job_id or "auto", strategy, current_tag, new_tag)
-
-            # Snapshot the original lines before touching the file so we
-            # can reliably restore even if the rollback file-edit also fails.
-            try:
-                with open(compose_file) as _f:
-                    _original_compose_lines = _f.readlines()
-            except Exception as _exc:
-                return {"success": False, "error": f"Cannot read {compose_file}: {_exc}"}
-
-            jl(f"Editing image tag in {compose_file}...")
-            ok, old_tag = set_compose_image_tag(compose_file, compose_svc, new_tag)
-            if not ok:
-                return {"success": False, "error": f"Failed to edit {compose_file}"}
-            _job_step(container, "compose_edited")
-
-            jl(f"Running: docker compose up -d {compose_svc}")
-            ok, err = run_compose_up(compose_file, compose_svc)
-            if not ok:
-                jl("Restoring compose file from snapshot...", "warn")
-                try:
-                    with open(compose_file, "w") as _f:
-                        _f.writelines(_original_compose_lines)
-                except Exception:
-                    pass
-                return {"success": False, "error": f"docker compose up failed: {err}"}
-            _job_step(container, "compose_up")
-
-            if not check_container_health(container, jlog=jl):
-                jl("Rolling back compose file from snapshot...", "warn")
-                try:
-                    with open(compose_file, "w") as _f:
-                        _f.writelines(_original_compose_lines)
-                    run_compose_up(compose_file, compose_svc)
-                except Exception:
-                    pass
-                notify(f"Update Failed: {container}", f"Rolled back to {old_tag}", priority="4", tags="warning")
-                send_webhook("update_failed", {"container": container, "attempted_tag": new_tag, "rolled_back_to": old_tag})
-                return {"success": False, "error": "Health check failed — auto-rolled back"}
-            _job_step(container, "healthy")
-
-            add_to_history(container, new_tag, status=history_status)
-            clear_available_update(container)
-            jl(f"Done! {current_tag} → {new_tag}")
-            notify(f"Updated: {container}", f"{container}: {current_tag} → {new_tag}", tags="white_check_mark")
-            send_webhook("update_success", {"container": container, "from_tag": current_tag, "to_tag": new_tag, "status": history_status})
-            return {"success": True, "message": f"Updated to {new_tag}"}
-
-        # ── DOCKER API ────────────────────────────────────────────────────
-        else:
-            _, current_tag = get_image_parts(container_obj)
-            jl(f"Current:    {current_tag}")
-            add_to_history(container, current_tag, status="previous")
-            _job_begin(container, job_id or "auto", strategy, current_tag, new_tag)
-
-            ok, err = recreate_container(client, container_obj, f"{image}:{new_tag}",
-                                         jlog=lambda m: jl(m))
-            if not ok:
-                return {"success": False, "error": err}
-            _job_step(container, "recreated")
-
-            if not check_container_health(container, jlog=jl):
-                jl("Rolling back to previous image...", "warn")
-                try:
-                    failed_obj = client.containers.get(container)
-                    recreate_container(client, failed_obj, f"{image}:{current_tag}",
-                                       jlog=lambda m: jl(m))
-                except Exception:
-                    pass
-                notify(f"Update Failed: {container}", f"Rolled back to {current_tag}", priority="4", tags="warning")
-                send_webhook("update_failed", {"container": container, "attempted_tag": new_tag, "rolled_back_to": current_tag})
-                return {"success": False, "error": "Health check failed — auto-rolled back"}
-            _job_step(container, "healthy")
-
-            add_to_history(container, new_tag, status=history_status)
-            clear_available_update(container)
-            jl(f"Done! {current_tag} → {new_tag}")
-            notify(f"Updated: {container}", f"{container}: {current_tag} → {new_tag}", tags="white_check_mark")
-            send_webhook("update_success", {"container": container, "from_tag": current_tag, "to_tag": new_tag, "status": history_status})
-            return {"success": True, "message": f"Updated to {new_tag}"}
+            return _update_env_file(client, obj, container, image, run_tag, cfg, new_tag, jl,
+                                    history_status, get_monitored_containers())
+        if strategy == STRATEGY_COMPOSE:
+            return _update_compose(obj, container, cfg, new_tag, jl, history_status)
+        return _update_docker_api(client, obj, container, image, run_tag, new_tag, jl, history_status)
 
     except Exception as exc:
-        log.error("update_service %s: %s", container, exc)
+        log.error("update_service %s: %s", container, exc, exc_info=True)
         return {"success": False, "error": str(exc)}
     finally:
-        # Cleared on every path Python actually executes (success, handled
-        # failure, or a caught exception). If the row is still there on
-        # next startup, the process itself died mid-update — see
-        # check_for_interrupted_jobs().
-        _job_end(container)
         with _active_lock:
             _active_containers.discard(container)
 
@@ -1793,243 +1464,201 @@ def rollback_service(container: str, target_tag: str = None, job_id: str = None)
     def jl(msg, level="info"):
         _jlog(job_id, msg, level)
 
+    if not NAME_RE.match(container or ""):
+        return {"success": False, "error": "Invalid container name"}
     try:
-        history = get_history(container)
-        if not history:
-            return {"success": False, "error": "No version history available"}
+        obj = get_docker_client().containers.get(container)
+    except dockerlib.errors.NotFound:
+        return {"success": False, "error": f"Container {container} not found"}
+    if not _is_monitored(obj):
+        return {"success": False, "error": f"{container} is not monitored by DUMMY"}
 
-        if not target_tag:
-            candidates = [h for h in history if h["status"] in ("previous", "deployed", "rolled_back")]
-            if len(candidates) < 2:
-                return {"success": False, "error": "No previous version to roll back to"}
-            target_tag = candidates[1]["tag"]
+    _, run_tag = get_image_parts(obj)
+    cfg = _resolve_strategy(container, _get_dummy_labels(obj))
+    current = _effective_current(cfg, run_tag, read_env_cached())
 
-        jl(f"Rolling back {container} to {target_tag}")
-        result = update_service(container, target_tag, job_id=job_id,
-                                history_status="rolled_back")
-        return result
+    if not target_tag:
+        candidates = [h["tag"] for h in get_history(container)
+                      if h["tag"] != current and h["status"] in ("previous", "deployed", "rolled_back")]
+        if not candidates:
+            return {"success": False, "error": "No previous version to roll back to"}
+        target_tag = candidates[0]
 
-    except Exception as exc:
-        log.error("rollback_service %s: %s", container, exc)
-        return {"success": False, "error": str(exc)}
+    if not TAG_RE.match(target_tag):
+        return {"success": False, "error": "Invalid target tag"}
 
-
-# ---------------------------------------------------------------------------
-# Stale data cleanup
-# ---------------------------------------------------------------------------
-
-def cleanup_stale_containers():
-    """
-    Remove available_updates and dismissed_updates rows for containers that
-    no longer exist in Docker. Runs at startup and periodically.
-    History is kept — it's useful even after a container is removed.
-    """
-    try:
-        client = get_docker_client()
-        live   = {c.name for c in client.containers.list(all=True)}
-        conn   = _get_conn()
-        c      = conn.cursor()
-        c.execute("SELECT DISTINCT container FROM available_updates")
-        stale  = [r[0] for r in c.fetchall() if r[0] not in live]
-        if stale:
-            placeholders = ",".join("?" * len(stale))
-            c.execute(f"DELETE FROM available_updates WHERE container IN ({placeholders})", stale)
-            c.execute(f"DELETE FROM dismissed_updates WHERE container IN ({placeholders})", stale)
-            conn.commit()
-            log.info("Cleaned up stale rows for %d removed container(s): %s",
-                     len(stale), ", ".join(stale))
-        conn.close()
-    except Exception as exc:
-        log.warning("cleanup_stale_containers: %s", exc)
+    jl(f"Rolling back {container} to {target_tag}")
+    return update_service(container, target_tag, job_id=job_id, history_status="rolled_back")
 
 
 # ---------------------------------------------------------------------------
 # Background checker
 # ---------------------------------------------------------------------------
 
-def _check_one_container(item: dict, cfg: dict, job_id: str = None) -> tuple:
-    """Check a single container item for updates. Returns (container, current, latest) or None."""
-    container   = item["container"]
-    image       = item["image"]
-    current_tag = item["current_tag"]
+def _check_one_container(item: dict, job_id: str = None):
+    container, image, current = item["container"], item["image"], item["current_tag"]
     if image == "unknown":
         return None
-    _jlog(job_id, f"Checking {container} ({current_tag})...")
-    latest = get_latest_tag(image, current_tag)
-    if latest and latest != current_tag and not is_dismissed(container, latest):
-        _jlog(job_id, f"  → Update available: {latest}")
-        save_available_update(container, latest)
-        return (container, current_tag, latest)
-    else:
-        if latest and is_dismissed(container, latest):
-            _jlog(job_id, f"  → {latest} available but dismissed")
-        else:
-            _jlog(job_id, f"  → Up to date")
-            # Genuinely up to date — clear any stale available_updates row.
-            # Without this, a row saved by an earlier check (back when this
-            # container really was behind) lingers forever once current_tag
-            # catches up through any path other than a normal DUMMY-driven
-            # update (e.g. a manual update, or the Plex .env-drift incident
-            # where the live container advanced without update_service ever
-            # running clear_available_update). Otherwise "Available" keeps
-            # showing a value identical to "Current" indefinitely.
-            clear_available_update(container)
+    _jlog(job_id, f"Checking {container} ({current})...")
+    latest = get_latest_tag(image, current)
+    if latest is None:
+        _jlog(job_id, "  → Registry lookup failed, keeping previous result", "warn")
         return None
+    if latest == current:
+        clear_available_update(container)   # stale badges go away once we're current
+        _jlog(job_id, "  → Up to date")
+        return None
+    if is_dismissed(container, latest):
+        _jlog(job_id, f"  → {latest} available but dismissed")
+        return None
+    _jlog(job_id, f"  → Update available: {latest}")
+    save_available_update(container, latest)
+    return (container, current, latest)
 
 
-def _check_once(job_id: str = None, target_container: str = None):
+def _check_once(job_id: str = None, target_container: str = None) -> str:
+    """Returns 'ok', 'busy', 'notfound' or 'error'."""
     global _last_check_time
 
-    # Debounce: only one check at a time
-    if _check_running.is_set():
+    if not _check_lock.acquire(blocking=False):
         _jlog(job_id, "A check is already in progress — skipping", "warn")
-        return
+        return "busy"
     _check_running.set()
-    global _check_started_at
-    _check_started_at = time.time()
 
     def jl(msg, level="info"):
         _jlog(job_id, msg, level)
 
-    cfg = get_all_settings()
     try:
-        all_containers = get_monitored_containers()
-        # Filter to single container if requested
-        containers = [c for c in all_containers if c["container"] == target_container]                      if target_container else all_containers
+        cfg = get_all_settings()
+        containers = get_monitored_containers()
+        if target_container:
+            containers = [c for c in containers if c["container"] == target_container]
+            if not containers:
+                jl(f"Container '{target_container}' not found or not monitored", "warn")
+                return "notfound"
 
-        if not containers and target_container:
-            jl(f"Container '{target_container}' not found or not monitored", "warn")
-            return
-
-        updates_found = []
         jl(f"Checking {len(containers)} container(s)...")
+        updates_found = []
+        handled = set()   # containers already updated this run, including peers
 
         for item in containers:
-            result = _check_one_container(item, cfg, job_id)
-            if result:
-                updates_found.append(result)
-                container, current_tag, latest = result
-                if cfg["auto_update"]:
-                    jl(f"  → AUTO_UPDATE: applying {latest}...")
-                    res = update_service(container, latest, job_id=job_id)
-                    if not res["success"]:
-                        jl(f"  → Auto-update failed: {res['error']}", "error")
+            name = item["container"]
+            if name in handled:
+                continue
+            result = _check_one_container(item, job_id)
+            if not result:
+                continue
+            updates_found.append(result)
+
+            if cfg["auto_update"] and item["status"] == "running" and not item["pinned"]:
+                jl(f"  → AUTO_UPDATE: applying {result[2]}...")
+                res = update_service(name, result[2], job_id=job_id)
+                handled.update(res.get("updated") or [name])
+                if not res["success"]:
+                    jl(f"  → Auto-update failed: {res['error']}", "error")
 
         _last_check_time = time.time()
+        pending = [u for u in updates_found if u[0] not in handled]
 
-        if updates_found and not cfg["auto_update"]:
-            lines = "\n".join(f"- {n}: {c} → {l}" for n, c, l in updates_found)
-            notify(f"{len(updates_found)} update(s) available", f"Updates ready:\n{lines}")
-            send_webhook("updates_found", {"count": len(updates_found),
-                         "updates": [{"container": n, "from": c, "to": l} for n, c, l in updates_found]})
-            jl(f"Found {len(updates_found)} update(s). Notifications sent.")
-        elif not updates_found:
+        if pending:
+            lines = "\n".join(f"- {n}: {c} → {l}" for n, c, l in pending)
+            notify(f"{len(pending)} update(s) available", f"Updates ready:\n{lines}")
+            send_webhook("updates_found", {"count": len(pending),
+                         "updates": [{"container": n, "from": c, "to": l} for n, c, l in pending]})
+            jl(f"Found {len(pending)} pending update(s). Notifications sent.")
+        else:
             jl("All containers are up to date.")
+        return "ok"
 
     except Exception as exc:
-        log.error("_check_once: %s", exc)
+        log.error("_check_once: %s", exc, exc_info=True)
         jl(f"Check failed: {exc}", "error")
+        return "error"
     finally:
         _check_running.clear()
+        _check_lock.release()
+
+
+def reconcile_leftovers():
+    """At startup, recover any container left as {name}-dummy-old by an interrupted run."""
+    try:
+        client = get_docker_client()
+        for c in client.containers.list(all=True):
+            if not c.name.endswith(BACKUP_SUFFIX):
+                continue
+            base = c.name[: -len(BACKUP_SUFFIX)]
+            err = _recover_leftover(client, base, lambda m, lvl="info": log.warning(m))
+            if err:
+                log.error("Leftover recovery: %s", err)
+                notify(f"Manual action needed: {base}", err, priority="5", tags="rotating_light")
+    except Exception as exc:
+        log.warning("reconcile_leftovers: %s", exc)
 
 
 def check_for_updates():
     global _next_check_time
-    # Clean up stale rows on first run
+    reconcile_leftovers()
     cleanup_stale_containers()
     while True:
-        log.info("Running update check...")
         _check_once()
-        cleanup_stale_containers()   # clean up after each check too
-        interval = get_all_settings()["check_interval"]
-        _next_check_time = time.time() + interval
-        time.sleep(interval)
+        cleanup_stale_containers()
+        # Re-read the interval each time; a settings change wakes this wait early
+        # and reschedules without running another check.
+        while True:
+            interval = get_all_settings()["check_interval"]
+            _next_check_time = time.time() + interval
+            if not _interval_changed.wait(interval):
+                break
+            _interval_changed.clear()
 
-
-# ---------------------------------------------------------------------------
-# Persistence check
-# ---------------------------------------------------------------------------
 
 def _check_persistence() -> bool:
     try:
-        db_dir     = os.path.dirname(DB_PATH)
-        data_dev   = os.stat(db_dir).st_dev
-        parent_dev = os.stat(os.path.dirname(db_dir.rstrip("/"))).st_dev
-        return data_dev != parent_dev
+        db_dir = os.path.dirname(DB_PATH)
+        return os.stat(db_dir).st_dev != os.stat(os.path.dirname(db_dir.rstrip("/"))).st_dev
     except Exception:
         return True
 
 
 # ---------------------------------------------------------------------------
-# Flask app + HTML template
+# Flask app + auth
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
 
-import base64 as _base64
-import hmac as _hmac
-from functools import wraps
-from flask import abort
-from werkzeug.exceptions import HTTPException
 
 @app.errorhandler(Exception)
 def _handle_exception(exc):
-    """Return all unhandled exceptions as JSON so the UI always gets parseable responses."""
     if isinstance(exc, HTTPException):
         return jsonify({"success": False, "error": exc.description, "status": exc.code}), exc.code
     log.error("Unhandled exception: %s", exc, exc_info=True)
     return jsonify({"success": False, "error": "Internal server error", "status": 500}), 500
 
-def _valid_creds(user: str, passwd: str) -> bool:
-    """Constant-time credential comparison to avoid timing side-channels."""
-    user_ok = _hmac.compare_digest(user.encode("utf-8"), BASIC_AUTH_USER.encode("utf-8"))
-    pass_ok = _hmac.compare_digest(passwd.encode("utf-8"), BASIC_AUTH_PASS.encode("utf-8"))
-    return user_ok and pass_ok
+
+def _basic_auth_ok() -> bool:
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Basic "):
+        return False
+    try:
+        creds = base64.b64decode(auth[6:]).decode("utf-8")
+    except Exception:
+        return False
+    user, _, passwd = creds.partition(":")
+    return hmac.compare_digest(user, BASIC_AUTH_USER) and hmac.compare_digest(passwd, BASIC_AUTH_PASS)
 
 
-def _require_auth(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if not BASIC_AUTH_USER:
-            return f(*args, **kwargs)
-        auth = request.headers.get("Authorization", "")
-        if auth.startswith("Basic "):
-            try:
-                creds = _base64.b64decode(auth[6:]).decode("utf-8")
-                user, _, passwd = creds.partition(":")
-                if _valid_creds(user, passwd):
-                    return f(*args, **kwargs)
-            except Exception:
-                pass
-        return Response(
-            "Authentication required",
-            status=401,
-            headers={"WWW-Authenticate": 'Basic realm="DUMMY"'},
-        )
-    return decorated
-
-# Apply auth globally
 @app.before_request
 def _check_auth():
-    if not BASIC_AUTH_USER:
-        return  # auth disabled
-    # Allow health endpoint without auth (for Docker HEALTHCHECK)
-    if request.path == "/health":
+    if not BASIC_AUTH_USER or request.path == "/health":
         return
-    auth = request.headers.get("Authorization", "")
-    if auth.startswith("Basic "):
-        try:
-            creds = _base64.b64decode(auth[6:]).decode("utf-8")
-            user, _, passwd = creds.partition(":")
-            if _valid_creds(user, passwd):
-                return  # authenticated
-        except Exception:
-            pass
-    return Response(
-        "Authentication required",
-        status=401,
-        headers={"WWW-Authenticate": 'Basic realm="DUMMY"'},
-    )
+    if _basic_auth_ok():
+        return
+    return Response("Authentication required", status=401,
+                    headers={"WWW-Authenticate": 'Basic realm="DUMMY"'})
 
+
+# ---------------------------------------------------------------------------
+# HTML
+# ---------------------------------------------------------------------------
 HTML = r"""<!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
@@ -2037,7 +1666,6 @@ HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{{ title }}</title>
 <style>
-/* ── Theme variables ─────────────────────────────────────────────────────── */
 :root {
   --bg:          linear-gradient(135deg,#1a1a2e 0%,#16213e 50%,#0f3460 100%);
   --surface:     rgba(255,255,255,0.05);
@@ -2072,25 +1700,18 @@ HTML = r"""<!DOCTYPE html>
   --code-bg:     rgba(0,0,0,0.06);
   --shadow:      rgba(0,0,0,0.12);
 }
-
-/* ── Reset + base ────────────────────────────────────────────────────────── */
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
      background:var(--bg);min-height:100vh;padding:20px;
      color:var(--text-hi);transition:background .3s,color .3s}
 .wrap{max-width:1100px;margin:0 auto}
-
-/* ── Dashboard header ────────────────────────────────────────────────────── */
 .dash{background:var(--surface);backdrop-filter:blur(12px);
-      border:1px solid var(--border);border-radius:18px;
-      padding:24px;margin-bottom:20px}
+      border:1px solid var(--border);border-radius:18px;padding:24px;margin-bottom:20px}
 .dash-title-row{display:flex;justify-content:space-between;align-items:flex-start;
                 margin-bottom:20px;flex-wrap:wrap;gap:10px}
 .dash-title h1{color:var(--text-hi);font-size:1.7em;margin-bottom:2px}
 .dash-title p{color:var(--text-lo);font-size:.88em;font-style:italic}
 .dash-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-
-/* ── Stat grid ───────────────────────────────────────────────────────────── */
 .stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
 .stat-card{background:var(--surface-2);border:1px solid var(--border);
            border-radius:12px;padding:16px 18px;text-align:center}
@@ -2098,36 +1719,24 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
 .stat-lbl{color:var(--text-md);font-size:.82em;margin-top:5px}
 .stat-card.has-updates .stat-num{color:#f59e0b}
 .stat-card.all-good .stat-num{color:#34d399}
-
-/* ── Dash info row ───────────────────────────────────────────────────────── */
 .dash-info-row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 .dash-panel{background:var(--surface-2);border:1px solid var(--border);
             border-radius:12px;padding:16px}
 .dash-panel-lbl{font-size:.75em;font-weight:700;text-transform:uppercase;
                 letter-spacing:.07em;color:var(--text-lo);margin-bottom:10px}
-
-/* ── Config flags ────────────────────────────────────────────────────────── */
 .flags{display:flex;flex-wrap:wrap;gap:7px}
 .flag{font-size:.78em;font-weight:600;padding:4px 10px;border-radius:20px}
 .flag-on {background:rgba(52,211,153,.15);color:#34d399;border:1px solid rgba(52,211,153,.3)}
 .flag-off{background:rgba(100,116,139,.1);color:var(--text-md);border:1px solid rgba(100,116,139,.2)}
 .flag-warn{background:rgba(245,158,11,.15);color:#f59e0b;border:1px solid rgba(245,158,11,.3)}
 .flag-ok {background:rgba(52,211,153,.1);color:#34d399;border:1px solid rgba(52,211,153,.2)}
-
-/* ── Timing panel ────────────────────────────────────────────────────────── */
 .timing{display:flex;flex-direction:column;gap:6px;margin-bottom:12px}
 .timing-row{display:flex;gap:6px;align-items:center;font-size:.85em;color:var(--text-md)}
-.timing-row .t-icon{font-size:1em}
 .timing-row .t-val{color:var(--text-hi);font-weight:600}
 .action-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:4px}
-
-/* ── Warn bar ────────────────────────────────────────────────────────────── */
 .warn-bar{background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.3);
-          border-radius:10px;padding:10px 16px;margin-bottom:16px;
-          color:#f59e0b;font-size:.87em}
+          border-radius:10px;padding:10px 16px;margin-bottom:16px;color:#f59e0b;font-size:.87em}
 .warn-bar code{background:var(--code-bg);padding:1px 6px;border-radius:4px;font-family:monospace}
-
-/* ── Generic buttons ─────────────────────────────────────────────────────── */
 .btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border:none;
      border-radius:8px;font-weight:600;cursor:pointer;font-size:.87em;
      transition:all .18s;text-decoration:none;white-space:nowrap}
@@ -2136,42 +1745,34 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
 .btn-ghost:hover{background:var(--surface);color:var(--text-hi)}
 .btn-primary{background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff}
 .btn-primary:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 4px 14px rgba(99,102,241,.4)}
-.btn-danger{background:rgba(239,68,68,.85);color:#fff}
-.btn-danger:hover:not(:disabled){background:rgba(239,68,68,1)}
-.btn-success{background:rgba(52,211,153,.2);color:#34d399;border:1px solid rgba(52,211,153,.3)}
 .btn-warn{background:rgba(245,158,11,.15);color:#f59e0b;border:1px solid rgba(245,158,11,.3)}
 .btn-warn:hover:not(:disabled){background:rgba(245,158,11,.25)}
 .btn-sm{padding:4px 10px;font-size:.78em;border-radius:6px}
-
-/* ── Cards ───────────────────────────────────────────────────────────────── */
+.btn-dismiss{background:rgba(100,116,139,.12);color:var(--text-lo);border:1px solid rgba(100,116,139,.2)}
+.btn-dismiss:hover{background:rgba(100,116,139,.25);color:var(--text-md)}
 .card{background:var(--surface);border:1px solid var(--border);
       border-radius:14px;margin-bottom:10px;overflow:hidden;
       transition:border-color .2s,box-shadow .2s}
 .card:hover{box-shadow:0 4px 20px var(--shadow)}
 .card.has-update{border-left:3px solid #f59e0b}
 .card.stopped-card{opacity:.7}
-
-/* card header — always visible, no collapse */
+.card.updating{border-left:3px solid #6366f1;opacity:.85}
+.card.hidden{display:none}
 .card-header{display:flex;justify-content:space-between;align-items:flex-start;
-             padding:14px 18px;flex-wrap:nowrap;gap:12px}
+             padding:14px 18px;gap:12px}
 .card-left{flex:1;min-width:0}
-.cname{font-size:1.1em;font-weight:700;color:var(--text-hi);
-       word-break:break-word;padding-top:1px}
-
-/* badges stack vertically on the right, never wrap below the name */
+.cname{font-size:1.1em;font-weight:700;color:var(--text-hi);word-break:break-word;padding-top:1px}
 .badges{display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex-shrink:0}
 .badge{padding:3px 9px;border-radius:20px;font-size:.72em;font-weight:700;
        text-transform:uppercase;letter-spacing:.04em;white-space:nowrap}
 .b-running {background:rgba(52,211,153,.15);color:#34d399;border:1px solid rgba(52,211,153,.3)}
 .b-stopped {background:rgba(248,113,113,.15);color:#f87171;border:1px solid rgba(248,113,113,.3)}
 .b-update  {background:rgba(245,158,11,.15);color:#f59e0b;border:1px solid rgba(245,158,11,.3)}
+.b-drift   {background:rgba(245,158,11,.1);color:#f59e0b;border:1px dashed rgba(245,158,11,.4);font-size:.68em}
 .b-strategy{background:rgba(99,102,241,.1);color:#a5b4fc;border:1px solid rgba(99,102,241,.2);font-size:.68em}
-
-/* card body — always visible */
-.card-body{display:block}
+.b-pinned  {background:rgba(148,163,184,.1);color:var(--text-md);border:1px solid rgba(148,163,184,.25);font-size:.68em}
+.b-updating{background:rgba(99,102,241,.2);color:#a5b4fc;border:1px solid rgba(99,102,241,.4);font-size:.68em}
 .card-inner{padding:0 18px 18px}
-
-/* info grid */
 .info-block{background:rgba(0,0,0,.15);border-radius:10px;padding:12px 14px;margin-bottom:12px}
 [data-theme="light"] .info-block{background:rgba(0,0,0,.04)}
 .info-row{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin:6px 0}
@@ -2179,8 +1780,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
 .val{font-family:monospace;background:var(--val-bg);border:1px solid var(--val-border);
      padding:2px 9px;border-radius:5px;font-size:.84em;color:var(--val-text)}
 .val.available{background:rgba(245,158,11,.12);border-color:rgba(245,158,11,.3);color:#fbbf24}
-
-/* version history */
 .history-block{margin-bottom:12px}
 .history-lbl{font-size:.75em;font-weight:700;text-transform:uppercase;letter-spacing:.07em;
              color:var(--text-lo);margin-bottom:8px}
@@ -2190,30 +1789,20 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
 .h-tag{font-family:monospace;font-size:.82em;color:var(--text-md);flex:1;min-width:120px}
 .h-date{font-size:.78em;color:var(--text-lo)}
 .h-pill{font-size:.7em;padding:2px 8px;border-radius:10px;font-weight:600}
-.h-deployed  {background:rgba(52,211,153,.1);color:#34d399}
+.h-deployed{background:rgba(52,211,153,.1);color:#34d399}
 .h-rolled_back{background:rgba(245,158,11,.1);color:#f59e0b}
-.h-previous  {background:rgba(100,116,139,.1);color:var(--text-md)}
-
-/* action buttons row */
+.h-previous{background:rgba(100,116,139,.1);color:var(--text-md)}
 .btns{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-
-/* feedback message */
 .msg{padding:10px 14px;border-radius:8px;margin-bottom:10px;display:none;font-size:.87em}
-.msg-ok {background:rgba(52,211,153,.15);border:1px solid rgba(52,211,153,.3);color:#34d399}
-.msg-err{background:rgba(248,113,113,.15);border:1px solid rgba(248,113,113,.3);color:#f87171}
-
-/* ── Progress modal ───────────────────────────────────────────────────────── */
-.overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);
-         backdrop-filter:blur(4px);z-index:1000;
+.checked-at{font-size:.75em;color:var(--text-lo);margin-top:4px;font-style:italic}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);backdrop-filter:blur(4px);z-index:1000;
          display:flex;align-items:center;justify-content:center;
          opacity:0;pointer-events:none;transition:opacity .2s}
 .overlay.visible{opacity:1;pointer-events:all}
 .modal{background:var(--surface-2);border:1px solid var(--border-2);
-       border-radius:16px;width:min(560px,95vw);
-       display:flex;flex-direction:column;max-height:80vh;
-       box-shadow:0 20px 60px var(--shadow)}
-.modal-head{display:flex;align-items:center;gap:12px;padding:18px 20px;
-            border-bottom:1px solid var(--border)}
+       border-radius:16px;width:min(560px,95vw);display:flex;flex-direction:column;
+       max-height:80vh;box-shadow:0 20px 60px var(--shadow)}
+.modal-head{display:flex;align-items:center;gap:12px;padding:18px 20px;border-bottom:1px solid var(--border)}
 .modal-icon{font-size:1.3em;flex-shrink:0}
 .modal-title-text{font-weight:700;color:var(--text-hi);font-size:1.05em}
 .modal-log{flex:1;overflow-y:auto;padding:14px 18px;font-family:monospace;
@@ -2223,90 +1812,46 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
 .log-msg{color:var(--text-md)}
 .log-msg.warn{color:#f59e0b}
 .log-msg.error{color:#f87171}
-.modal-foot{padding:14px 20px;border-top:1px solid var(--border);
-            display:flex;justify-content:flex-end;gap:8px}
-
-/* ── Spinner ─────────────────────────────────────────────────────────────── */
+.modal-foot{padding:14px 20px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:8px}
 @keyframes spin{to{transform:rotate(360deg)}}
-.spinner{display:inline-block;width:18px;height:18px;
-         border:2px solid var(--border-2);border-top-color:var(--accent);
-         border-radius:50%;animation:spin .7s linear infinite;flex-shrink:0}
-
-/* ── Search / filter bar ─────────────────────────────────────────────────── */
+.spinner{display:inline-block;width:18px;height:18px;border:2px solid var(--border-2);
+         border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;flex-shrink:0}
 .filter-bar{display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
-.filter-input{flex:1;min-width:160px;background:var(--surface-2);
-              border:1px solid var(--border-2);border-radius:8px;
-              padding:8px 12px;color:var(--text-hi);font-size:.87em;outline:none;
-              transition:border-color .2s}
+.filter-input{flex:1;min-width:160px;background:var(--surface-2);border:1px solid var(--border-2);
+              border-radius:8px;padding:8px 12px;color:var(--text-hi);font-size:.87em;outline:none}
 .filter-input:focus{border-color:var(--accent)}
 .filter-input::placeholder{color:var(--text-lo)}
-.btn-filter{padding:7px 14px;font-size:.82em}
 .btn-filter.active{background:var(--accent-2);color:#fff;border-color:var(--accent-2)}
-.card.hidden{display:none}
-
-/* ── Pinned badge ─────────────────────────────────────────────────────────── */
-.b-pinned{background:rgba(148,163,184,.1);color:var(--text-md);
-          border:1px solid rgba(148,163,184,.25);font-size:.68em}
-
-/* ── Updating badge ───────────────────────────────────────────────────────── */
-.b-updating{background:rgba(99,102,241,.2);color:#a5b4fc;
-            border:1px solid rgba(99,102,241,.4);font-size:.68em}
-.card.updating{border-left:3px solid #6366f1;opacity:.85}
-
-/* ── Dismiss button ───────────────────────────────────────────────────────── */
-.btn-dismiss{background:rgba(100,116,139,.12);color:var(--text-lo);
-             border:1px solid rgba(100,116,139,.2)}
-.btn-dismiss:hover{background:rgba(100,116,139,.25);color:var(--text-md)}
-
-/* ── Checked-at row ───────────────────────────────────────────────────────── */
-.checked-at{font-size:.75em;color:var(--text-lo);margin-top:4px;font-style:italic}
-
-/* ── Setup box (empty state) ─────────────────────────────────────────────── */
 .setup-box{background:rgba(99,102,241,.07);border:1px solid rgba(99,102,241,.2);
            border-radius:14px;padding:28px;text-align:center;color:var(--text-md)}
 .setup-box h2{color:#a5b4fc;margin-bottom:10px}
-.setup-box pre{background:var(--code-bg);padding:12px 16px;border-radius:8px;
-               text-align:left;font-size:.85em;color:var(--val-text);
-               margin:12px 0;overflow-x:auto}
-
-/* ── Theme button — fixed so it never jumps ──────────────────────────────── */
-#btn-theme{position:fixed;top:14px;right:14px;z-index:500;
-           padding:6px 14px;font-size:.82em;
+.setup-box pre{background:var(--code-bg);padding:12px 16px;border-radius:8px;text-align:left;
+               font-size:.85em;color:var(--val-text);margin:12px 0;overflow-x:auto}
+#btn-theme{position:fixed;top:14px;right:14px;z-index:500;padding:6px 14px;font-size:.82em;
            box-shadow:0 2px 10px var(--shadow)}
-
-/* ── Settings modal ──────────────────────────────────────────────────────── */
 .settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;padding:18px 20px}
 .setting-row{display:flex;flex-direction:column;gap:6px}
 .setting-lbl{font-size:.82em;font-weight:700;color:var(--text-md);text-transform:uppercase;letter-spacing:.05em}
 .setting-desc{font-size:.76em;color:var(--text-lo);margin-top:-2px}
-.setting-val select,.setting-val input[type=number]{
-  background:var(--val-bg);border:1px solid var(--val-border);
-  color:var(--text-hi);padding:7px 10px;border-radius:8px;font-size:.88em;width:100%;
-  outline:none;transition:border-color .2s}
-.setting-val select:focus,.setting-val input[type=number]:focus{border-color:var(--accent)}
+.setting-val select{background:var(--val-bg);border:1px solid var(--val-border);color:var(--text-hi);
+  padding:7px 10px;border-radius:8px;font-size:.88em;width:100%;outline:none}
 .toggle-wrap{display:flex;align-items:center;gap:10px;margin-top:4px}
 .toggle{position:relative;width:42px;height:24px;flex-shrink:0}
 .toggle input{opacity:0;width:0;height:0}
-.toggle-slider{position:absolute;inset:0;background:rgba(100,116,139,.3);
-               border-radius:24px;cursor:pointer;transition:background .2s}
-.toggle-slider:before{content:"";position:absolute;height:18px;width:18px;
-                       left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.2s}
+.toggle-slider{position:absolute;inset:0;background:rgba(100,116,139,.3);border-radius:24px;cursor:pointer;transition:background .2s}
+.toggle-slider:before{content:"";position:absolute;height:18px;width:18px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.2s}
 .toggle input:checked + .toggle-slider{background:#6366f1}
 .toggle input:checked + .toggle-slider:before{transform:translateX(18px)}
 .toggle-label{font-size:.88em;color:var(--text-md)}
-.settings-footer{padding:14px 20px;border-top:1px solid var(--border);
-                 display:flex;justify-content:space-between;align-items:center;gap:8px}
+.settings-footer{padding:14px 20px;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;gap:8px}
 .settings-saved{font-size:.85em;color:#34d399;opacity:0;transition:opacity .4s}
 .settings-saved.show{opacity:1}
-
-/* ── Responsive ──────────────────────────────────────────────────────────── */
 @media(max-width:680px){
   .stat-grid{grid-template-columns:repeat(2,1fr)}
   .dash-info-row{grid-template-columns:1fr}
   .settings-grid{grid-template-columns:1fr}
 }
 @media(max-width:420px){
-  .stat-grid{grid-template-columns:repeat(2,1fr)}
   .card-header{padding:12px 14px}
   .card-inner{padding:0 14px 14px}
 }
@@ -2315,7 +1860,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
 <body>
 <div class="wrap">
 
-  <!-- ── Dashboard ────────────────────────────────────────────────────────── -->
   <div class="dash">
     <div class="dash-title-row">
       <div class="dash-title">
@@ -2325,11 +1869,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
       <div class="dash-controls">
         <button class="btn btn-ghost" onclick="openSettings()">&#9881; Settings</button>
       </div>
-      <!-- theme button rendered fixed via CSS, outside flow -->
       <button class="btn btn-ghost" id="btn-theme" onclick="toggleTheme()">&#9788; Light</button>
     </div>
 
-    <!-- Stat cards -->
     <div class="stat-grid">
       <div class="stat-card">
         <div class="stat-num">{{ containers|length }}</div>
@@ -2349,52 +1891,30 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
       </div>
     </div>
 
-    <!-- Config + timing row -->
     <div class="dash-info-row">
-      <!-- Config flags -->
       <div class="dash-panel">
         <div class="dash-panel-lbl">Configuration</div>
         <div class="flags">
-          <span class="flag {{ 'flag-on' if allow_prerelease else 'flag-off' }}">
-            Pre-releases {{ 'ON' if allow_prerelease else 'OFF' }}
-          </span>
-          <span class="flag {{ 'flag-on' if auto_update else 'flag-off' }}">
-            Auto-update {{ 'ON' if auto_update else 'OFF' }}
-          </span>
-          <span class="flag {{ 'flag-on' if ntfy_enabled else 'flag-off' }}">
-            Notifications {{ 'ON' if ntfy_enabled else 'OFF' }}
-          </span>
-          <span class="flag {{ 'flag-ok' if persistent else 'flag-warn' }}">
-            Persistence {{ 'OK' if persistent else 'WARNING' }}
-          </span>
-          <span class="flag flag-off">
-            History {{ history_limit }} versions
-          </span>
+          <span class="flag {{ 'flag-on' if allow_prerelease else 'flag-off' }}">Pre-releases {{ 'ON' if allow_prerelease else 'OFF' }}</span>
+          <span class="flag {{ 'flag-on' if auto_update else 'flag-off' }}">Auto-update {{ 'ON' if auto_update else 'OFF' }}</span>
+          <span class="flag {{ 'flag-on' if ntfy_enabled else 'flag-off' }}">Notifications {{ 'ON' if ntfy_enabled else 'OFF' }}</span>
+          <span class="flag {{ 'flag-ok' if persistent else 'flag-warn' }}">Persistence {{ 'OK' if persistent else 'WARNING' }}</span>
+          <span class="flag {{ 'flag-on' if auth_enabled else 'flag-warn' }}">Auth {{ 'ON' if auth_enabled else 'OFF' }}</span>
+          <span class="flag flag-off">History {{ history_limit }} versions</span>
         </div>
       </div>
 
-      <!-- Timing + actions -->
       <div class="dash-panel">
         <div class="dash-panel-lbl">Update Checks (every {{ check_interval_h }})</div>
         <div class="timing">
-          <div class="timing-row">
-            <span class="t-icon">&#x23F0;</span>
-            <span>Last checked:</span>
-            <span class="t-val" id="last-checked">Loading...</span>
-          </div>
-          <div class="timing-row">
-            <span class="t-icon">&#x23F3;</span>
-            <span>Next check in:</span>
-            <span class="t-val" id="next-check">Loading...</span>
-          </div>
+          <div class="timing-row"><span>&#x23F0; Last checked:</span><span class="t-val" id="last-checked">Loading...</span></div>
+          <div class="timing-row"><span>&#x23F3; Next check in:</span><span class="t-val" id="next-check">Loading...</span></div>
         </div>
         <div class="action-row">
           <button class="btn btn-primary" id="btn-check" onclick="checkNow()">
             <span id="check-icon">&#8635;</span> Check Now
           </button>
-          <a class="btn btn-ghost" href="/api/history/export" download="dummy-history.json">
-            &#x2193; Export History
-          </a>
+          <a class="btn btn-ghost" href="/api/history/export" download="dummy-history.json">&#x2193; Export History</a>
         </div>
       </div>
     </div>
@@ -2404,36 +1924,26 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
   <div class="warn-bar">
     &#9888; <strong>Persistence warning:</strong> <code>/data</code> is not bind-mounted.
     History and rollback data will be lost on restart.
-    Add <code>- /stacks/data/dummy:/data</code> to your compose volumes.
   </div>
   {% endif %}
 
-  <!-- ── Filter bar ──────────────────────────────────────────────────────── -->
   {% if containers %}
   <div class="filter-bar">
-    <input class="filter-input" id="filter-input" type="text"
-           placeholder="&#128269; Filter containers..." oninput="filterCards()">
-    <button class="btn btn-ghost btn-filter" id="btn-filter-updates"
-            onclick="toggleFilterUpdates()">Updates only</button>
+    <input class="filter-input" id="filter-input" type="text" placeholder="&#128269; Filter containers..." oninput="filterCards()">
+    <button class="btn btn-ghost btn-filter" id="btn-filter-updates" onclick="toggleFilterUpdates()">Updates only</button>
   </div>
-  {% endif %}
 
-  <!-- ── Container cards ──────────────────────────────────────────────────── -->
-  {% if containers %}
     {% for u in containers %}
     <div class="card {% if u.has_update %}has-update{% endif %} {% if u.status != 'running' %}stopped-card{% endif %}"
          id="card-{{ u.container }}">
-
-      <!-- Header -->
       <div class="card-header">
         <div class="card-left">
           <span class="cname">{{ u.container }}</span>
         </div>
         <div class="badges">
-          <span class="badge {{ 'b-running' if u.status == 'running' else 'b-stopped' }}">
-            {{ u.status }}
-          </span>
+          <span class="badge {{ 'b-running' if u.status == 'running' else 'b-stopped' }}">{{ u.status }}</span>
           <span class="badge b-strategy">{{ u.strategy_label }}</span>
+          {% if u.drift %}<span class="badge b-drift">config ≠ running</span>{% endif %}
           {% if u.pinned %}
           <span class="badge b-pinned">&#128274; PINNED</span>
           {% elif u.has_update %}
@@ -2442,77 +1952,53 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
         </div>
       </div>
 
-      <div class="card-body">
-        <div class="card-inner">
-
-          <!-- Info -->
-          <div class="info-block">
-            <div class="info-row">
-              <span class="lbl">Image</span>
-              <span class="val">{{ u.image }}</span>
-            </div>
-            <div class="info-row">
-              <span class="lbl">Current</span>
-              <span class="val">{{ u.current_tag }}</span>
-            </div>
-            {% if u.available_tag %}
-            <div class="info-row">
-              <span class="lbl">Available</span>
-              <span class="val available">{{ u.available_tag }}</span>
-            </div>
-            {% endif %}
-          </div>
-
-          <!-- Version history with per-entry rollback -->
-          {% if u.history %}
-          <div class="history-block">
-            <div class="history-lbl">Version History</div>
-            {% for h in u.history %}
-            <div class="h-item">
-              <span class="h-tag">{{ h.tag }}</span>
-              <span class="h-date">{{ h.date[:10] }}</span>
-              <span class="h-pill h-{{ h.status }}">{{ h.status }}</span>
-              {% if not loop.first %}
-              <button class="btn btn-warn btn-sm"
-                      onclick="rollbackTo('{{ u.container }}','{{ h.tag }}')">
-                &#x21A9; Restore
-              </button>
-              {% endif %}
-            </div>
-            {% endfor %}
-          </div>
+      <div class="card-inner">
+        <div class="info-block">
+          <div class="info-row"><span class="lbl">Image</span><span class="val">{{ u.image }}</span></div>
+          <div class="info-row"><span class="lbl">Config</span><span class="val">{{ u.current_tag }}</span></div>
+          <div class="info-row"><span class="lbl">Running</span><span class="val {{ 'available' if u.drift }}">{{ u.running_tag }}</span></div>
+          {% if u.available_tag %}
+          <div class="info-row"><span class="lbl">Available</span><span class="val available">{{ u.available_tag }}</span></div>
           {% endif %}
-
-          <!-- Messages -->
-          <div class="msg msg-ok"  id="msg-ok-{{ u.container }}"></div>
-          <div class="msg msg-err" id="msg-err-{{ u.container }}"></div>
-
-          <!-- Action buttons -->
-          <div class="btns">
-            {% if u.has_update and not auto_update %}
-            <button class="btn btn-primary"
-                    id="btn-upd-{{ u.container }}"
-                    onclick="doUpdate('{{ u.container }}','{{ u.available_tag }}')">
-              &#x2B06; Update to {{ u.available_tag }}
-            </button>
-            <button class="btn btn-dismiss btn-sm"
-                    onclick="dismissUpdate('{{ u.container }}','{{ u.available_tag }}')"
-                    title="Hide this update">
-              &#x2715; Dismiss
-            </button>
-            {% endif %}
-            {% if u.changelog %}
-            <a class="btn btn-ghost"
-               href="{{ u.changelog }}" target="_blank" rel="noopener">
-              &#x1F4DD; Changelog
-            </a>
-            {% endif %}
-          </div>
-          {% if u.checked_at %}
-          <div class="checked-at">Last checked: {{ u.checked_at[:16]|replace("T"," ") }}</div>
-          {% endif %}
-
         </div>
+
+        {% if u.history %}
+        <div class="history-block">
+          <div class="history-lbl">Version History</div>
+          {% for h in u.history %}
+          <div class="h-item">
+            <span class="h-tag">{{ h.tag }}</span>
+            <span class="h-date">{{ h.date[:10] }}</span>
+            <span class="h-pill h-{{ h.status }}">{{ h.status }}</span>
+            {% if not loop.first %}
+            <button class="btn btn-warn btn-sm" data-action="rollback"
+                    data-container="{{ u.container }}" data-tag="{{ h.tag }}">&#x21A9; Restore</button>
+            {% endif %}
+          </div>
+          {% endfor %}
+        </div>
+        {% endif %}
+
+        <div class="msg msg-ok"  id="msg-ok-{{ u.container }}"></div>
+        <div class="msg msg-err" id="msg-err-{{ u.container }}"></div>
+
+        <div class="btns">
+          {% if u.has_update and not auto_update %}
+          <button class="btn btn-primary" data-action="update"
+                  data-container="{{ u.container }}" data-tag="{{ u.available_tag }}">
+            &#x2B06; {{ 'Reconcile to' if u.drift and u.available_tag == u.current_tag else 'Update to' }} {{ u.available_tag }}
+          </button>
+          <button class="btn btn-dismiss btn-sm" data-action="dismiss"
+                  data-container="{{ u.container }}" data-tag="{{ u.available_tag }}"
+                  title="Hide this update">&#x2715; Dismiss</button>
+          {% endif %}
+          {% if u.changelog %}
+          <a class="btn btn-ghost" href="{{ u.changelog }}" target="_blank" rel="noopener">&#x1F4DD; Changelog</a>
+          {% endif %}
+        </div>
+        {% if u.checked_at %}
+        <div class="checked-at">Last checked: {{ u.checked_at[:16]|replace("T"," ") }}</div>
+        {% endif %}
       </div>
     </div>
     {% endfor %}
@@ -2533,7 +2019,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
 
 </div>
 
-<!-- ── Settings modal ──────────────────────────────────────────────────────── -->
 <div class="overlay" id="settings-overlay">
   <div class="modal" style="max-width:520px">
     <div class="modal-head">
@@ -2541,7 +2026,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
       <span class="modal-title-text">Settings</span>
     </div>
     <div class="settings-grid">
-
       <div class="setting-row">
         <span class="setting-lbl">Check Interval</span>
         <span class="setting-desc">How often to poll for updates</span>
@@ -2549,50 +2033,40 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
           <select id="cfg-interval">
             <option value="3600">Every 1 hour</option>
             <option value="7200">Every 2 hours</option>
-            <option value="21600" selected>Every 6 hours</option>
+            <option value="21600">Every 6 hours</option>
             <option value="43200">Every 12 hours</option>
             <option value="86400">Every 24 hours</option>
           </select>
         </div>
       </div>
-
       <div class="setting-row">
         <span class="setting-lbl">History Limit</span>
         <span class="setting-desc">Versions to keep per container</span>
         <div class="setting-val">
           <select id="cfg-history">
             <option value="3">3 versions</option>
-            <option value="5" selected>5 versions</option>
+            <option value="5">5 versions</option>
             <option value="10">10 versions</option>
             <option value="20">20 versions</option>
           </select>
         </div>
       </div>
-
       <div class="setting-row">
         <span class="setting-lbl">Pre-releases</span>
         <span class="setting-desc">Include alpha/beta/RC tags</span>
         <div class="toggle-wrap">
-          <label class="toggle">
-            <input type="checkbox" id="cfg-prerelease">
-            <span class="toggle-slider"></span>
-          </label>
+          <label class="toggle"><input type="checkbox" id="cfg-prerelease"><span class="toggle-slider"></span></label>
           <span class="toggle-label" id="cfg-prerelease-lbl">Off</span>
         </div>
       </div>
-
       <div class="setting-row">
         <span class="setting-lbl">Auto-update</span>
         <span class="setting-desc">Apply updates without confirmation</span>
         <div class="toggle-wrap">
-          <label class="toggle">
-            <input type="checkbox" id="cfg-autoupdate">
-            <span class="toggle-slider"></span>
-          </label>
+          <label class="toggle"><input type="checkbox" id="cfg-autoupdate"><span class="toggle-slider"></span></label>
           <span class="toggle-label" id="cfg-autoupdate-lbl">Off</span>
         </div>
       </div>
-
     </div>
     <div class="settings-footer">
       <span class="settings-saved" id="settings-saved">&#10003; Saved</span>
@@ -2604,7 +2078,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
   </div>
 </div>
 
-<!-- ── Progress modal ──────────────────────────────────────────────────────── -->
 <div class="overlay" id="overlay">
   <div class="modal">
     <div class="modal-head">
@@ -2613,19 +2086,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
     </div>
     <div class="modal-log" id="modal-log"></div>
     <div class="modal-foot">
-      <button class="btn btn-ghost" id="modal-close" disabled onclick="closeModal()">
-        Close &amp; Refresh
-      </button>
+      <button class="btn btn-ghost" id="modal-close" disabled onclick="closeModal()">Close</button>
     </div>
   </div>
 </div>
 
 <script>
-// ── Theme ──────────────────────────────────────────────────────────────────
-function initTheme(){
-  const t = localStorage.getItem('dummy-theme') || 'dark';
-  applyTheme(t);
-}
+function initTheme(){ applyTheme(localStorage.getItem('dummy-theme') || 'dark'); }
 function applyTheme(t){
   document.documentElement.setAttribute('data-theme', t);
   const btn = document.getElementById('btn-theme');
@@ -2633,256 +2100,174 @@ function applyTheme(t){
   localStorage.setItem('dummy-theme', t);
 }
 function toggleTheme(){
-  const cur = document.documentElement.getAttribute('data-theme');
-  applyTheme(cur === 'dark' ? 'light' : 'dark');
+  applyTheme(document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
 }
 
-// ── Status polling (last checked / next check countdown) ───────────────────
 let _nextCheckTs = 0;
-let _countdownTick;
-
 function initStatus(){
   fetchStatus();
-  // Poll frequently while updates are active, slower otherwise
-  setInterval(async () => {
-    await fetchStatus();
-  }, 5000);
-  _countdownTick = setInterval(tickCountdown, 1000);
+  setInterval(fetchStatus, 5000);
+  setInterval(tickCountdown, 1000);
 }
-
 async function fetchStatus(){
   try {
-    const r = await fetch('/api/status');
-    const d = await r.json();
+    const d = await (await fetch('/api/status')).json();
     _nextCheckTs = d.next_check_time * 1000;
     const el = document.getElementById('last-checked');
     if(el) el.textContent = d.last_check_time ? ago(d.last_check_time * 1000) : 'Never';
     tickCountdown();
-    // Mark cards that are currently being updated
-    if(d.active_updates) {
-      document.querySelectorAll('.card[id^="card-"]').forEach(card => {
-        const name = card.id.replace('card-', '');
-        const isActive = d.active_updates.includes(name);
-        card.classList.toggle('updating', isActive);
-        const badge = card.querySelector('.b-updating');
-        if(isActive && !badge){
-          const b = document.createElement('span');
-          b.className = 'badge b-updating';
-          b.textContent = '⟳ UPDATING';
-          const badges = card.querySelector('.badges');
-          if(badges) badges.appendChild(b);
-        } else if(!isActive && badge){
-          badge.remove();
-        }
-      });
-    }
+    document.querySelectorAll('.card[id^="card-"]').forEach(card => {
+      const name = card.id.replace('card-', '');
+      const isActive = d.active_updates.includes(name);
+      card.classList.toggle('updating', isActive);
+      const badge = card.querySelector('.b-updating');
+      if(isActive && !badge){
+        const b = document.createElement('span');
+        b.className = 'badge b-updating';
+        b.textContent = '⟳ UPDATING';
+        const badges = card.querySelector('.badges');
+        if(badges) badges.appendChild(b);
+      } else if(!isActive && badge){
+        badge.remove();
+      }
+    });
   } catch(e){}
 }
-
 function tickCountdown(){
   const el = document.getElementById('next-check');
   if(!el) return;
   if(!_nextCheckTs){ el.textContent = '—'; return; }
   const ms = _nextCheckTs - Date.now();
   if(ms <= 0){ el.textContent = 'Soon...'; return; }
-  const h = Math.floor(ms / 3600000);
-  const m = Math.floor((ms % 3600000) / 60000);
-  const s = Math.floor((ms % 60000) / 1000);
+  const h = Math.floor(ms / 3600000), m = Math.floor((ms % 3600000) / 60000), s = Math.floor((ms % 60000) / 1000);
   el.textContent = h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${s}s` : `${s}s`;
 }
-
 function ago(ts){
-  const ms = Date.now() - ts;
-  const m = Math.floor(ms / 60000);
-  const h = Math.floor(m / 60);
+  const m = Math.floor((Date.now() - ts) / 60000), h = Math.floor(m / 60);
   if(h > 0) return `${h}h ${m % 60}m ago`;
   if(m > 0) return `${m}m ago`;
   return 'Just now';
 }
 
-// ── Settings ────────────────────────────────────────────────────────────────
 function openSettings(){
-  // Load current values from API then show modal
-  fetch('/api/settings').then(r=>r.json()).then(cfg => {
+  fetch('/api/settings').then(r => r.json()).then(cfg => {
     const sel = document.getElementById('cfg-interval');
-    if(sel){
-      // Select closest matching option
-      const opts = [...sel.options].map(o=>parseInt(o.value));
-      const ci = cfg.check_interval;
-      sel.value = opts.reduce((a,b) => Math.abs(b-ci) < Math.abs(a-ci) ? b : a);
-    }
-    const sh = document.getElementById('cfg-history');
-    if(sh) sh.value = cfg.history_limit;
+    const opts = [...sel.options].map(o => parseInt(o.value));
+    sel.value = opts.reduce((a, b) => Math.abs(b - cfg.check_interval) < Math.abs(a - cfg.check_interval) ? b : a);
+    document.getElementById('cfg-history').value = cfg.history_limit;
     setToggle('cfg-prerelease', 'cfg-prerelease-lbl', cfg.allow_prerelease);
     setToggle('cfg-autoupdate', 'cfg-autoupdate-lbl', cfg.auto_update);
     document.getElementById('settings-saved').classList.remove('show');
     document.getElementById('settings-overlay').classList.add('visible');
-  }).catch(()=>{
-    document.getElementById('settings-overlay').classList.add('visible');
-  });
+  }).catch(() => document.getElementById('settings-overlay').classList.add('visible'));
 }
-
-function closeSettings(){
-  document.getElementById('settings-overlay').classList.remove('visible');
-}
-
+function closeSettings(){ document.getElementById('settings-overlay').classList.remove('visible'); }
 function setToggle(id, lblId, val){
-  const cb = document.getElementById(id);
-  const lbl = document.getElementById(lblId);
-  if(cb) cb.checked = !!val;
-  if(lbl) lbl.textContent = val ? 'On' : 'Off';
+  document.getElementById(id).checked = !!val;
+  document.getElementById(lblId).textContent = val ? 'On' : 'Off';
 }
-
-// Update label text when toggle is clicked
 ['cfg-prerelease','cfg-autoupdate'].forEach(id => {
-  document.addEventListener('DOMContentLoaded', () => {
-    const cb = document.getElementById(id);
-    if(cb) cb.addEventListener('change', () => {
-      const lbl = document.getElementById(id+'-lbl');
-      if(lbl) lbl.textContent = cb.checked ? 'On' : 'Off';
-    });
+  document.getElementById(id).addEventListener('change', e => {
+    document.getElementById(id + '-lbl').textContent = e.target.checked ? 'On' : 'Off';
   });
 });
-
 async function saveSettings(){
   const payload = {
-    check_interval:   parseInt(document.getElementById('cfg-interval').value),
-    history_limit:    parseInt(document.getElementById('cfg-history').value),
+    check_interval: parseInt(document.getElementById('cfg-interval').value),
+    history_limit: parseInt(document.getElementById('cfg-history').value),
     allow_prerelease: document.getElementById('cfg-prerelease').checked,
-    auto_update:      document.getElementById('cfg-autoupdate').checked,
+    auto_update: document.getElementById('cfg-autoupdate').checked,
   };
   try {
-    const r = await fetch('/api/settings', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify(payload)
-    });
-    const d = await r.json();
+    const d = await (await fetch('/api/settings', {
+      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload)
+    })).json();
     if(d.success){
       const saved = document.getElementById('settings-saved');
       saved.classList.add('show');
-      setTimeout(() => { saved.classList.remove('show'); }, 2500);
-      // Reload after short delay so dashboard reflects new settings
+      setTimeout(() => saved.classList.remove('show'), 2500);
       setTimeout(() => { closeSettings(); location.reload(); }, 1200);
     }
   } catch(e){ alert('Save failed: ' + e.message); }
 }
-
-// Close settings on overlay click
 document.getElementById('settings-overlay').addEventListener('click', function(e){
   if(e.target === this) closeSettings();
 });
 
-// ── Check Now ───────────────────────────────────────────────────────────────
 async function checkNow(){
   const btn = document.getElementById('btn-check');
   const icon = document.getElementById('check-icon');
   btn.disabled = true;
   icon.innerHTML = '<div class="spinner" style="width:14px;height:14px;display:inline-block"></div>';
-
   openModal('Checking for updates...');
-
   try {
-    const r = await fetch('/api/check', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
-      body: JSON.stringify({}),
-    });
-    // Guard against non-JSON responses (e.g. Caddy redirect → 405 HTML page)
+    const r = await fetch('/api/check', {method:'POST', headers:{'Content-Type':'application/json','Accept':'application/json'}, body:'{}'});
     const ct = r.headers.get('Content-Type') || '';
-    if (!ct.includes('application/json')) {
-      const text = await r.text();
-      const hint = r.status === 405 ? ' (HTTP 405 — possible proxy redirect issue)' :
-                   r.status === 301 || r.status === 302 ? ' (redirect — check proxy config)' : '';
-      throw new Error(`Server returned HTTP ${r.status}${hint}`);
-    }
+    if(!ct.includes('application/json')) throw new Error(`Server returned HTTP ${r.status}`);
     const d = await r.json();
-    if (d.error) throw new Error(d.error);
-    const jobId = d.job_id;
-    if(jobId){
-      const result = await pollJob(jobId);
-      modalDone(true, result && result.message ? result.message : 'Check complete');
-    } else {
-      // No job id returned — shouldn't happen but fail gracefully
-      throw new Error('No job ID returned from server');
-    }
+    if(d.error) throw new Error(d.error);
+    const result = await pollJob(d.job_id);
+    if(result && result.success) modalDone(true, result.message || 'Check complete');
+    else modalDone(false, result ? (result.error || 'Check failed') : 'Lost contact with server');
   } catch(e){
     appendLog('Error: ' + e.message, 'error');
     modalDone(false, 'Check failed: ' + e.message);
   }
-
   btn.disabled = false;
   icon.textContent = '\u21BB';
   fetchStatus();
 }
 
-// ── Update ──────────────────────────────────────────────────────────────────
-async function doUpdate(container, tag){
-  openModal(`Updating ${container} \u2192 ${tag}`);
+async function runJob(endpoint, body, title){
+  openModal(title);
   try {
-    const r = await fetch('/api/update', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({container, tag})
-    });
+    const r = await fetch(endpoint, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
     const d = await r.json();
-    if(d.job_id){
-      const result = await pollJob(d.job_id);
-      if(result && result.success){
-        modalDone(true, result.message || 'Update complete', true);
-      } else {
-        modalDone(false, result ? result.error : 'Unknown error');
-      }
-    }
+    if(!d.job_id){ modalDone(false, d.error || 'Request failed'); return; }
+    const result = await pollJob(d.job_id);
+    if(result && result.success) modalDone(true, result.message || 'Done', true);
+    else modalDone(false, result ? (result.error || 'Unknown error') : 'Lost contact with server');
   } catch(e){
     modalDone(false, 'Network error: ' + e.message);
   }
 }
-
-// ── Rollback ────────────────────────────────────────────────────────────────
-async function rollbackTo(container, tag){
+function doUpdate(container, tag){
+  return runJob('/api/update', {container, tag}, `Updating ${container} \u2192 ${tag}`);
+}
+function rollbackTo(container, tag){
   if(!confirm(`Restore ${container} to ${tag}?`)) return;
-  openModal(`Restoring ${container} \u2192 ${tag}`);
+  return runJob('/api/rollback', {container, tag}, `Restoring ${container} \u2192 ${tag}`);
+}
+async function dismissUpdate(container, tag){
+  if(!confirm(`Dismiss update to ${tag} for ${container}?\n\nIt won't appear again until a newer version is found.`)) return;
   try {
-    const r = await fetch('/api/rollback', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({container, tag})
-    });
-    const d = await r.json();
-    if(d.job_id){
-      const result = await pollJob(d.job_id);
-      if(result && result.success){
-        modalDone(true, result.message || 'Rollback complete', true);
-      } else {
-        modalDone(false, result ? result.error : 'Unknown error');
-      }
-    }
-  } catch(e){
-    modalDone(false, 'Network error: ' + e.message);
-  }
+    await fetch('/api/dismiss', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({container, tag})});
+    location.reload();
+  } catch(e){ alert('Dismiss failed: ' + e.message); }
 }
 
-// ── Job polling ─────────────────────────────────────────────────────────────
-let _lastLogCount = 0;
+document.addEventListener('click', e => {
+  const btn = e.target.closest('[data-action]');
+  if(!btn) return;
+  const {container, tag} = btn.dataset;
+  if(btn.dataset.action === 'update') doUpdate(container, tag);
+  else if(btn.dataset.action === 'rollback') rollbackTo(container, tag);
+  else if(btn.dataset.action === 'dismiss') dismissUpdate(container, tag);
+});
 
+let _lastLogCount = 0;
 async function pollJob(jobId){
   _lastLogCount = 0;
   return new Promise(resolve => {
+    const started = Date.now();
     const iv = setInterval(async () => {
       try {
-        const r = await fetch('/api/jobs/' + jobId);
-        const d = await r.json();
-
-        // Append any new log lines
-        const newLines = d.log.slice(_lastLogCount);
-        newLines.forEach(l => appendLog(l.msg, l.lvl));
+        const d = await (await fetch('/api/jobs/' + jobId)).json();
+        if(!d.log) { clearInterval(iv); resolve(null); return; }
+        d.log.slice(_lastLogCount).forEach(l => appendLog(l.msg, l.lvl));
         _lastLogCount = d.log.length;
-
-        if(d.done){
-          clearInterval(iv);
-          resolve(d);
-        }
+        if(d.done){ clearInterval(iv); resolve(d); }
+        else if(Date.now() - started > 1800000){ clearInterval(iv); resolve(null); }
       } catch(e){
         clearInterval(iv);
         resolve(null);
@@ -2891,7 +2276,6 @@ async function pollJob(jobId){
   });
 }
 
-// ── Modal ────────────────────────────────────────────────────────────────────
 function openModal(title){
   document.getElementById('modal-title').textContent = title;
   document.getElementById('modal-icon').innerHTML = '<div class="spinner"></div>';
@@ -2904,91 +2288,58 @@ function openModal(title){
   document.getElementById('overlay').classList.add('visible');
   _lastLogCount = 0;
 }
-
 function appendLog(msg, level){
-  const log = document.getElementById('modal-log');
+  const logEl = document.getElementById('modal-log');
   const line = document.createElement('div');
   line.className = 'log-line';
   const now = new Date();
-  const t = [now.getHours(), now.getMinutes(), now.getSeconds()]
-    .map(n => String(n).padStart(2,'0')).join(':');
+  const t = [now.getHours(), now.getMinutes(), now.getSeconds()].map(n => String(n).padStart(2,'0')).join(':');
   line.innerHTML = `<span class="log-t">${t}</span><span class="log-msg ${level||''}">${escHtml(msg)}</span>`;
-  log.appendChild(line);
-  log.scrollTop = log.scrollHeight;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
 }
-
 function modalDone(success, msg, reload=false){
   document.getElementById('modal-icon').textContent = success ? '\u2705' : '\u274C';
   if(msg) appendLog(msg, success ? 'info' : 'error');
   const close = document.getElementById('modal-close');
   close.disabled = false;
-  close.textContent = (success && reload) ? 'Close & Refresh' : 'Close';
   if(success && reload){
+    close.textContent = 'Close & Refresh';
     close.className = 'btn btn-primary';
     close.onclick = () => closeModal(true);
   } else {
+    close.textContent = 'Close';
     close.className = 'btn btn-ghost';
     close.onclick = () => closeModal(false);
   }
 }
-
 function closeModal(forceReload){
   document.getElementById('overlay').classList.remove('visible');
   if(forceReload) location.reload();
 }
-
-// Close modal on overlay click
 document.getElementById('overlay').addEventListener('click', function(e){
-  if(e.target === this && !document.getElementById('modal-close').disabled){
-    closeModal();
-  }
+  if(e.target === this && !document.getElementById('modal-close').disabled) closeModal();
 });
-
 function escHtml(s){
-  return String(s)
-    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
-    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-// ── Filter / search ─────────────────────────────────────────────────────────
 let _filterUpdatesOnly = false;
-
 function filterCards(){
   const q = (document.getElementById('filter-input').value || '').toLowerCase();
   document.querySelectorAll('.card[id^="card-"]').forEach(card => {
     const name = card.id.replace('card-', '').toLowerCase();
-    const hasUpdate = card.classList.contains('has-update');
     const matchText = !q || name.includes(q);
-    const matchFilter = !_filterUpdatesOnly || hasUpdate;
+    const matchFilter = !_filterUpdatesOnly || card.classList.contains('has-update');
     card.classList.toggle('hidden', !matchText || !matchFilter);
   });
 }
-
 function toggleFilterUpdates(){
   _filterUpdatesOnly = !_filterUpdatesOnly;
-  const btn = document.getElementById('btn-filter-updates');
-  if(btn) btn.classList.toggle('active', _filterUpdatesOnly);
+  document.getElementById('btn-filter-updates').classList.toggle('active', _filterUpdatesOnly);
   filterCards();
 }
 
-// ── Dismiss ──────────────────────────────────────────────────────────────────
-async function dismissUpdate(container, tag){
-  if(!confirm(`Dismiss update to ${tag} for ${container}?
-
-It won't appear again until a newer version is found.`)) return;
-  try {
-    await fetch('/api/dismiss', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({container, tag})
-    });
-    location.reload();
-  } catch(e) {
-    alert('Dismiss failed: ' + e.message);
-  }
-}
-
-// ── Init ─────────────────────────────────────────────────────────────────────
 initTheme();
 initStatus();
 </script>
@@ -3002,40 +2353,39 @@ initStatus();
 
 @app.route("/")
 def index():
-    containers    = get_monitored_containers()
+    containers = get_monitored_containers()
     updates_count = sum(1 for c in containers if c["has_update"])
     running_count = sum(1 for c in containers if c["status"] == "running")
     cfg = get_all_settings()
-    ci  = cfg["check_interval"]
+    ci = cfg["check_interval"]
     interval_h = f"{ci // 3600}h" if ci >= 3600 else f"{ci // 60}m"
     for c in containers:
         c.pop("_strategy_cfg", None)
     return render_template_string(
         HTML,
-        containers       = containers,
-        updates_count    = updates_count,
-        running_count    = running_count,
-        title            = WEB_TITLE,
-        check_interval_h = interval_h,
-        allow_prerelease = cfg["allow_prerelease"],
-        auto_update      = cfg["auto_update"],
-        ntfy_enabled     = bool(NTFY_ENDPOINT),
-        history_limit    = cfg["history_limit"],
-        persistent       = _check_persistence(),
+        containers=containers,
+        updates_count=updates_count,
+        running_count=running_count,
+        title=WEB_TITLE,
+        check_interval_h=interval_h,
+        allow_prerelease=cfg["allow_prerelease"],
+        auto_update=cfg["auto_update"],
+        ntfy_enabled=bool(NTFY_ENDPOINT),
+        auth_enabled=bool(BASIC_AUTH_USER),
+        history_limit=cfg["history_limit"],
+        persistent=_check_persistence(),
     )
 
 
 @app.route("/api/status")
 def api_status():
-    cfg = get_all_settings()
     with _active_lock:
         active = list(_active_containers)
     return jsonify({
         "last_check_time": _last_check_time,
         "next_check_time": _next_check_time,
-        "check_interval":  cfg["check_interval"],
-        "check_running":   _check_running.is_set(),
-        "active_updates":  active,
+        "check_running": _check_running.is_set(),
+        "active_updates": active,
     })
 
 
@@ -3046,10 +2396,12 @@ def api_settings_get():
 
 @app.route("/api/settings", methods=["POST"])
 def api_settings_post():
-    data = request.json or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"success": False, "error": "Expected a JSON object"}), 400
+
     allowed = {"check_interval", "allow_prerelease", "auto_update", "history_limit"}
-    saved = {}
-    errors = {}
+    saved, errors = {}, {}
     for key, value in data.items():
         if key not in allowed:
             errors[key] = "Unknown setting"
@@ -3057,98 +2409,95 @@ def api_settings_post():
         try:
             if key == "check_interval":
                 v = int(value)
-                if v < 60 or v > 86400:
+                if not 60 <= v <= 86400:
                     errors[key] = "Must be between 60 and 86400 seconds"
                     continue
                 save_setting(key, str(v))
+                _interval_changed.set()
                 saved[key] = v
             elif key == "history_limit":
                 v = int(value)
-                if v < 1 or v > 50:
+                if not 1 <= v <= 50:
                     errors[key] = "Must be between 1 and 50"
                     continue
                 save_setting(key, str(v))
                 saved[key] = v
-            elif key in ("allow_prerelease", "auto_update"):
+            else:
                 v = "true" if str(value).lower() in ("true", "1", "yes") else "false"
                 save_setting(key, v)
                 saved[key] = v == "true"
-        except Exception as exc:
+        except (TypeError, ValueError) as exc:
             errors[key] = str(exc)
     log.info("Settings updated: %s", saved)
-    return jsonify({"success": True, "saved": saved, "errors": errors})
+    return jsonify({"success": not errors, "saved": saved, "errors": errors})
 
 
 @app.route("/api/jobs/<job_id>")
 def api_job(job_id):
     with _jobs_lock:
         job = _jobs.get(job_id)
-    if not job:
-        return jsonify({"error": "Job not found"}), 404
-    return jsonify({
-        "done":    job["done"],
-        "success": job["success"],
-        "error":   job["error"],
-        "message": job["message"],
-        "log":     job["log"],
-    })
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        return jsonify({k: job[k] for k in ("done", "success", "error", "message", "log")})
+
+
+def _start_job(fn, *args, **kwargs):
+    job_id = _new_job()
+
+    def run():
+        try:
+            result = fn(*args, job_id=job_id, **kwargs)
+            _job_done(job_id, result.get("success", False),
+                      message=result.get("message", ""), error=result.get("error", ""))
+        except Exception as exc:
+            log.error("job %s crashed: %s", job_id, exc, exc_info=True)
+            _job_done(job_id, False, error=str(exc))
+
+    threading.Thread(target=run, daemon=True).start()
+    return job_id
 
 
 @app.route("/api/update", methods=["POST"])
 def api_update():
-    data = request.json or {}
+    data = request.get_json(silent=True) or {}
     container, tag = data.get("container"), data.get("tag")
-    if not container or not tag:
-        return jsonify({"success": False, "error": "Missing parameters"})
-
-    job_id = _new_job()
-
-    def run():
-        result = update_service(container, tag, job_id=job_id)
-        _job_done(job_id, result.get("success", False),
-                  message=result.get("message",""),
-                  error=result.get("error",""))
-
-    threading.Thread(target=run, daemon=True).start()
-    return jsonify({"job_id": job_id})
+    if not NAME_RE.match(container or "") or not TAG_RE.match(tag or ""):
+        return jsonify({"success": False, "error": "Invalid container or tag"}), 400
+    return jsonify({"job_id": _start_job(update_service, container, tag)})
 
 
 @app.route("/api/rollback", methods=["POST"])
 def api_rollback():
-    data = request.json or {}
-    container  = data.get("container")
-    target_tag = data.get("tag")
-    if not container:
-        return jsonify({"success": False, "error": "Missing container"})
-
-    job_id = _new_job()
-
-    def run():
-        result = rollback_service(container, target_tag, job_id=job_id)
-        _job_done(job_id, result.get("success", False),
-                  message=result.get("message",""),
-                  error=result.get("error",""))
-
-    threading.Thread(target=run, daemon=True).start()
-    return jsonify({"job_id": job_id})
+    data = request.get_json(silent=True) or {}
+    container, target = data.get("container"), data.get("tag")
+    if not NAME_RE.match(container or ""):
+        return jsonify({"success": False, "error": "Invalid container"}), 400
+    if target is not None and not TAG_RE.match(target):
+        return jsonify({"success": False, "error": "Invalid tag"}), 400
+    return jsonify({"job_id": _start_job(rollback_service, container, target)})
 
 
 @app.route("/api/check", methods=["POST"])
 def api_check():
+    data = request.get_json(silent=True) or {}
+    target = data.get("container")
+    if target is not None and not NAME_RE.match(target):
+        return jsonify({"success": False, "error": "Invalid container"}), 400
     if _check_running.is_set():
-        if time.time() - _check_started_at > 900:
-            log.warning("check_running flag stuck for >15min — force-clearing")
-            _check_running.clear()
-        else:
-            return jsonify({"success": False, "error": "A check is already in progress — try again shortly"}), 429
+        return jsonify({"success": False, "error": "A check is already in progress"}), 429
 
-    data      = request.json or {}
-    target    = data.get("container")   # optional: check just one container
-    job_id    = _new_job()
+    job_id = _new_job()
 
     def run():
-        _check_once(job_id=job_id, target_container=target)
-        _job_done(job_id, True, message="Check complete")
+        outcome = _check_once(job_id=job_id, target_container=target)
+        messages = {
+            "ok": (True, "Check complete", ""),
+            "busy": (False, "", "A check is already in progress"),
+            "notfound": (False, "", "Container not found or not monitored"),
+            "error": (False, "", "Check failed — see log"),
+        }
+        success, message, error = messages.get(outcome, (False, "", "Unknown result"))
+        _job_done(job_id, success, message=message, error=error)
 
     threading.Thread(target=run, daemon=True).start()
     return jsonify({"success": True, "job_id": job_id})
@@ -3165,102 +2514,85 @@ def api_containers():
 @app.route("/api/history/export")
 def api_history_export():
     try:
-        conn = _get_conn()
-        c = conn.cursor()
-        c.execute("SELECT container, tag, deployed_at, status FROM version_history ORDER BY deployed_at ASC")
-        rows = c.fetchall()
-        conn.close()
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT container, tag, deployed_at, status FROM version_history ORDER BY deployed_at ASC").fetchall()
         data = [{"container": r[0], "tag": r[1], "deployed_at": r[2], "status": r[3]} for r in rows]
         return Response(
             json.dumps({"exported_at": datetime.now().isoformat(), "history": data}, indent=2),
             mimetype="application/json",
-            headers={"Content-Disposition": "attachment; filename=dummy-history.json"}
+            headers={"Content-Disposition": "attachment; filename=dummy-history.json"},
         )
     except Exception as exc:
         log.error("api_history_export: %s", exc)
-        return jsonify({"success": False, "error": str(exc)})
+        return jsonify({"success": False, "error": str(exc)}), 500
 
 
 @app.route("/api/history/import", methods=["POST"])
 def api_history_import():
-    try:
-        data = request.json or {}
-        rows = data.get("history", [])
-        if not rows:
-            return jsonify({"success": False, "error": "No history entries in payload"})
-        conn = _get_conn()
-        c = conn.cursor()
-        inserted = skipped = 0
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"success": False, "error": "Expected a JSON object"}), 400
+    rows = data.get("history", [])
+    if not isinstance(rows, list) or not rows:
+        return jsonify({"success": False, "error": "No history entries in payload"}), 400
+
+    inserted = skipped = 0
+    with _db() as conn:
         for row in rows:
             try:
-                c.execute(
+                container, tag = row["container"], row["tag"]
+                deployed_at, status = row["deployed_at"], row["status"]
+                if not (NAME_RE.match(container) and TAG_RE.match(tag)
+                        and status in ("deployed", "previous", "rolled_back")):
+                    skipped += 1
+                    continue
+                cur = conn.execute(
                     """INSERT INTO version_history (container, tag, deployed_at, status)
                        SELECT ?,?,?,? WHERE NOT EXISTS (
                            SELECT 1 FROM version_history WHERE container=? AND deployed_at=?)""",
-                    (row["container"], row["tag"], row["deployed_at"], row["status"],
-                     row["container"], row["deployed_at"])
-                )
-                if c.rowcount: inserted += 1
-                else: skipped += 1
-            except Exception:
+                    (container, tag, deployed_at, status, container, deployed_at))
+                if cur.rowcount:
+                    inserted += 1
+                else:
+                    skipped += 1
+            except (KeyError, TypeError, sqlite3.Error):
                 skipped += 1
-        conn.commit()
-        conn.close()
-        return jsonify({"success": True, "inserted": inserted, "skipped": skipped})
-    except Exception as exc:
-        log.error("api_history_import: %s", exc)
-        return jsonify({"success": False, "error": str(exc)})
+    return jsonify({"success": True, "inserted": inserted, "skipped": skipped})
 
 
 @app.route("/api/history/<container>")
 def api_container_history(container):
+    if not NAME_RE.match(container):
+        abort(400)
     return jsonify(get_history(container))
 
 
 @app.route("/api/dismiss", methods=["POST"])
 def api_dismiss():
-    data      = request.json or {}
-    container = data.get("container")
-    tag       = data.get("tag")
-    if not container or not tag:
-        return jsonify({"success": False, "error": "Missing container or tag"})
+    data = request.get_json(silent=True) or {}
+    container, tag = data.get("container"), data.get("tag")
+    if not NAME_RE.match(container or "") or not TAG_RE.match(tag or ""):
+        return jsonify({"success": False, "error": "Invalid container or tag"}), 400
     dismiss_update(container, tag)
     return jsonify({"success": True})
 
 
 @app.route("/api/undismiss", methods=["POST"])
 def api_undismiss():
-    data      = request.json or {}
-    container = data.get("container")
-    tag       = data.get("tag")
-    if not container:
-        return jsonify({"success": False, "error": "Missing container"})
+    data = request.get_json(silent=True) or {}
+    container, tag = data.get("container"), data.get("tag")
+    if not NAME_RE.match(container or ""):
+        return jsonify({"success": False, "error": "Invalid container"}), 400
+    if tag is not None and not TAG_RE.match(tag):
+        return jsonify({"success": False, "error": "Invalid tag"}), 400
     undismiss_update(container, tag)
     return jsonify({"success": True})
 
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "containers_monitored": len(get_monitored_containers())})
-
-
-@app.route("/api/backups")
-def api_backups():
-    return jsonify({
-        "success": True,
-        "enabled": DB_BACKUP_ENABLED,
-        "interval_hours": DB_BACKUP_INTERVAL // 3600,
-        "keep": DB_BACKUP_KEEP,
-        "backups": list_db_backups(),
-    })
-
-
-@app.route("/api/backups/run", methods=["POST"])
-def api_backups_run():
-    path = backup_db()
-    if not path:
-        return jsonify({"success": False, "error": "Backup failed — check DUMMY logs"})
-    return jsonify({"success": True, "path": path})
+    return jsonify({"status": "ok"})
 
 
 # ---------------------------------------------------------------------------
@@ -3270,9 +2602,10 @@ if __name__ == "__main__":
     log.info("=== DUMMY - Docker Update Made Manageable, Yay! ===")
     log.info("Allow prerelease: %s | Auto-update: %s | Check interval: %ds",
              ALLOW_PRERELEASE, AUTO_UPDATE, CHECK_INTERVAL)
+    if not BASIC_AUTH_USER:
+        log.warning("BASIC_AUTH_USER is not set — the web UI and API are unauthenticated.")
     init_db()
-    check_for_interrupted_jobs()
     _next_check_time = time.time() + CHECK_INTERVAL
     threading.Thread(target=check_for_updates, daemon=True).start()
-    threading.Thread(target=run_db_backups, daemon=True).start()
+    # Single process only: job state and operation locks live in memory.
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
