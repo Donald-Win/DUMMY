@@ -192,7 +192,7 @@ def _job_done(job_id, success: bool, message: str = "", error: str = ""):
 # ---------------------------------------------------------------------------
 # Tag filtering
 # ---------------------------------------------------------------------------
-_PRE_WORDS = r"alpha|beta|rc|nightly|edge|dev|devel|test|snapshot|experimental|staging|canary|preview|prerelease|pre-release"
+_PRE_WORDS = r"alpha|beta|rc|nightly|edge|dev|devel|develop|development|unstable|next|git|test|snapshot|experimental|staging|canary|preview|prerelease|pre-release"
 _CI_WORDS  = r"pr|feature|feat|fix|hotfix|refs|sha|build|ci|main|master"
 _PRE_RE    = re.compile(rf"(?:^|[-_.])(?:{_PRE_WORDS})(?=$|[-_.\d])", re.I)
 _CI_RE     = re.compile(rf"(?:^|[-_.])(?:{_CI_WORDS})(?=$|[-_.\d])", re.I)
