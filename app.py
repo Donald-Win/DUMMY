@@ -274,9 +274,12 @@ def _ghcr_headers() -> dict:
 
 
 def query_dockerhub(org: str, repo: str, current_tag: str):
+    """
+    Returns the newest stable tag, current_tag if the lookup succeeded and
+    nothing newer exists, or None if the registry could not be read.
+    """
     url = f"https://hub.docker.com/v2/repositories/{org}/{repo}/tags?page_size=100&ordering=last_updated"
-    all_tags = []
-    page = 0
+    all_tags, page, fetched = [], 0, False
     try:
         while url and page < 5:
             page += 1
@@ -285,13 +288,16 @@ def query_dockerhub(org: str, repo: str, current_tag: str):
                 log.warning("DockerHub %s/%s HTTP %s", org, repo,
                             resp.status_code if resp is not None else "no-response")
                 break
+            fetched = True
             remaining = resp.headers.get("X-RateLimit-Remaining")
             if remaining and int(remaining) < 10:
                 log.warning("DockerHub rate limit low: %s requests remaining", remaining)
             body = resp.json()
             all_tags.extend(t["name"] for t in body.get("results", []))
             url = body.get("next")
-        return _find_newest_tag(all_tags, current_tag)
+        if not fetched:
+            return None
+        return _find_newest_tag(all_tags, current_tag) or current_tag
     except Exception as exc:
         log.error("query_dockerhub %s/%s: %s", org, repo, exc)
         return None
@@ -310,9 +316,9 @@ def _parse_link_next(link_header: str) -> str:
 
 def _query_ghcr_registry_api(org: str, repo: str, current_tag: str):
     """
-    Docker Registry v2 API on ghcr.io. Tags sort alphabetically, so we start
-    the scan at current_tag and walk forward. Falls back to a scan from the
-    beginning if the cursor pass finds nothing.
+    Docker Registry v2 API on ghcr.io. Tags sort alphabetically, so the scan
+    starts at current_tag. Returns the newest tag, current_tag if the registry
+    was read but nothing newer exists, or None if it could not be read.
     """
     image_path = f"{org}/{repo}"
     try:
@@ -325,6 +331,7 @@ def _query_ghcr_registry_api(org: str, repo: str, current_tag: str):
         if not token:
             return None
         headers = {"Authorization": f"Bearer {token}"}
+        fetched = {"ok": False}
 
         def _fetch_pages(start_url: str, max_pages: int) -> list:
             tags, url, page = [], start_url, 0
@@ -335,20 +342,23 @@ def _query_ghcr_registry_api(org: str, repo: str, current_tag: str):
                     log.warning("GHCR tags %s page %d HTTP %s", image_path, page,
                                 resp.status_code if resp is not None else "no-response")
                     break
+                fetched["ok"] = True
                 tags.extend(resp.json().get("tags") or [])
                 url = _parse_link_next(resp.headers.get("Link", ""))
             return tags
 
-        cursor = current_tag
-        cursor_url = f"https://ghcr.io/v2/{image_path}/tags/list?n=500&last={cursor}"
+        cursor_url = f"https://ghcr.io/v2/{image_path}/tags/list?n=500&last={current_tag}"
         result = _find_newest_tag(_fetch_pages(cursor_url, max_pages=20), current_tag)
         if result:
             return result
 
-        return _find_newest_tag(
+        result = _find_newest_tag(
             _fetch_pages(f"https://ghcr.io/v2/{image_path}/tags/list?n=1000", max_pages=5),
             current_tag,
         )
+        if result:
+            return result
+        return current_tag if fetched["ok"] else None
     except Exception as exc:
         log.error("_query_ghcr_registry_api %s/%s: %s", org, repo, exc)
         return None
